@@ -1,0 +1,40 @@
+.DS_Store
+
+# Python/local environment
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Project data and generated outputs
+data/
+brain_tumor_dimension/
+bran_tumor_dimension/
+tumor_measurements_by_case.csv
+
+# Medical imaging/raw data files
+*.mha
+*.nii
+*.nii.gz
+*.nrrd
+*.dcm
+*.dicom
+*.itksnap
+
+# Model artifacts and large generated files
+checkpoints/
+models/
+runs/
+outputs/
+results/
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.onnx

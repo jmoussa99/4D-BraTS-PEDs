@@ -1,0 +1,22 @@
+# Core ML stack for LongiTumorMamba.
+#
+# Install into the project virtualenv, for example:
+#   .venv/bin/python -m pip install -r requirements-ml.txt
+#
+# PyTorch wheels vary by platform. On Apple Silicon, the default pip wheel
+# supports CPU/MPS. On CUDA systems, follow https://pytorch.org/get-started/.
+torch
+numpy
+pandas
+scipy
+SimpleITK
+nibabel
+tqdm
+scikit-image
+
+# Optional but useful for medical-imaging transforms and sliding-window inference.
+monai
+
+# Optional acceleration for true Mamba sequence mixing. Install separately after
+# PyTorch is working; the code falls back to a lightweight Conv1d mixer.
+# mamba-ssm
