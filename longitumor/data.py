@@ -4,7 +4,7 @@ import csv
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 
@@ -31,6 +31,84 @@ MODALITY_SUFFIX_RE = re.compile(r"_000([0-3])([_\s][^/]*)?\.nii(\.gz)?$", re.IGN
 SEG_EXTENSIONS = (".nii", ".nii.gz", ".mha")
 PREFERRED_SEG_TOKENS = ("REVISED", "UPDATED", "v2", "V2", "my_", "MY_", "ens", "ENS", "E-", "E_")
 MAX_SEG_UNIQUE_VALUES = 16
+DATE_RE = re.compile(r"(?:19|20)\d{2}[-_]?\d{2}[-_]?\d{2}|(?:19|20)\d{6}")
+VISIT_RE = re.compile(r"(?:^|[_\-\s])(visit|timepoint|tp|scan|study|ses|session|fu|followup)[_\-\s]*([a-z0-9]+)", re.IGNORECASE)
+SEGMENTATION_TOKENS = {
+    "seg",
+    "segs",
+    "segmentation",
+    "segmentations",
+    "mask",
+    "masks",
+    "label",
+    "labels",
+    "annotation",
+    "annotations",
+    "truth",
+    "manual",
+    "gt",
+}
+MODALITY_ALIASES = {
+    "flair": {
+        "flair",
+        "t2flair",
+        "t2_flair",
+        "t2-flair",
+        "fluidattenuatedinversionrecovery",
+        "fluid_attenuated_inversion_recovery",
+        "fluid-attenuated-inversion-recovery",
+    },
+    "t1c": {
+        "t1c",
+        "t1ce",
+        "t1gd",
+        "t1_gd",
+        "t1-gd",
+        "t1gad",
+        "t1_gad",
+        "t1-gad",
+        "t1post",
+        "t1_post",
+        "t1-post",
+        "t1wpost",
+        "t1w_post",
+        "t1w-post",
+        "t1weightedpost",
+        "t1weighted_post",
+        "t1weighted-post",
+        "postcontrast",
+        "post_contrast",
+        "post-contrast",
+        "postgad",
+        "post_gad",
+        "post-gad",
+        "ce",
+        "cetr1",
+        "cet1",
+        "ce_t1",
+        "ce-t1",
+        "contrast",
+        "enhanced",
+    },
+    "t1": {
+        "t1",
+        "t1w",
+        "t1weighted",
+        "t1_weighted",
+        "t1-weighted",
+        "t1pre",
+        "t1_pre",
+        "t1-pre",
+        "t1wpre",
+        "t1w_pre",
+        "t1w-pre",
+        "precontrast",
+        "pre_contrast",
+        "pre-contrast",
+        "native",
+    },
+    "t2": {"t2", "t2w", "t2weighted", "t2_weighted", "t2-weighted"},
+}
 
 
 @dataclass(frozen=True)
@@ -53,24 +131,92 @@ def _is_image_file(path: Path) -> bool:
     return path.is_file() and not path.name.startswith(".") and name.endswith(SEG_EXTENSIONS)
 
 
-def discover_modalities(case_dir: Path) -> tuple[str | None, ...]:
-    """Return modality paths ordered as T1, T2, T1c, FLAIR.
+def _strip_image_suffix(name: str) -> str:
+    lower = name.lower()
+    for suffix in (".nii.gz", ".nii", ".mha"):
+        if lower.endswith(suffix):
+            return name[: -len(suffix)]
+    return Path(name).stem
 
-    The pedBRATS folders in this workspace use `_0000` through `_0003` suffixes.
-    We keep the architecture order stable (`T1`, `T2`, `T1c`, `FLAIR`) while
-    accepting the numeric filenames present on disk.
+
+def _tokens(path: Path) -> set[str]:
+    stem = _strip_image_suffix(path.name).lower()
+    pieces = [piece for piece in re.split(r"[^a-z0-9]+", stem) if piece]
+    tokens = set(pieces)
+    tokens.add("".join(pieces))
+    for left, right in zip(pieces, pieces[1:]):
+        tokens.add(left + right)
+        tokens.add(f"{left}_{right}")
+        tokens.add(f"{left}-{right}")
+    return tokens
+
+
+def infer_modality(path: Path) -> str | None:
+    """Infer MRI modality from a NIfTI/MHA filename.
+
+    Explicit contrast names win over BraTS/nnU-Net numeric suffixes. This keeps
+    arbitrary clinical filenames usable while preserving `_0000.._0003` support.
     """
 
+    toks = _tokens(path)
+    if toks & SEGMENTATION_TOKENS:
+        return None
+    for modality in ("flair", "t1c", "t2", "t1"):
+        if toks & MODALITY_ALIASES[modality]:
+            return modality
+    match = MODALITY_SUFFIX_RE.search(path.name)
+    if match:
+        return MODALITY_NAMES[int(match.group(1))]
+    return None
+
+
+def _modality_score(path: Path, modality: str) -> tuple[int, int, str]:
+    toks = _tokens(path)
+    exact = int(modality in toks)
+    alias_hits = len(toks & MODALITY_ALIASES[modality])
+    numeric = int(MODALITY_SUFFIX_RE.search(path.name) is not None)
+    return exact + alias_hits + numeric, -path.stat().st_size, path.name
+
+
+ModalityClassifier = Callable[[Path], tuple[str, float]]
+
+
+def discover_modalities(
+    case_dir: Path,
+    modality_classifier: ModalityClassifier | None = None,
+    classifier_threshold: float = 0.70,
+) -> tuple[str | None, ...]:
+    """Return modality paths ordered as T1, T2, T1c, FLAIR."""
+
     paths: list[str | None] = [None] * len(MODALITY_NAMES)
+    candidates: dict[str, list[Path]] = {name: [] for name in MODALITY_NAMES}
+    classifier_scores: dict[Path, float] = {}
     for item in case_dir.iterdir():
         if not _is_image_file(item):
             continue
-        match = MODALITY_SUFFIX_RE.search(item.name)
-        if not match:
+        modality = infer_modality(item)
+        if modality is None and modality_classifier is not None:
+            try:
+                if _looks_like_label_volume(item):
+                    continue
+            except Exception:
+                pass
+            predicted_modality, confidence = modality_classifier(item)
+            if confidence >= classifier_threshold and predicted_modality in candidates:
+                modality = predicted_modality
+                classifier_scores[item] = confidence
+        if modality is None:
             continue
-        idx = int(match.group(1))
-        if idx < len(paths):
-            paths[idx] = str(item)
+        candidates[modality].append(item)
+    for idx, modality in enumerate(MODALITY_NAMES):
+        if candidates[modality]:
+            paths[idx] = str(
+                sorted(
+                    candidates[modality],
+                    key=lambda p: (classifier_scores.get(p, 0.0), *_modality_score(p, modality)),
+                    reverse=True,
+                )[0]
+            )
     return tuple(paths)
 
 
@@ -91,11 +237,12 @@ def _looks_like_label_volume(path: Path) -> bool:
     return bool(uniq.min() >= 0 and uniq.max() <= 20)
 
 
-def find_segmentation_file(case_dir: Path) -> Path | None:
+def find_segmentation_file(case_dir: Path, excluded_paths: Sequence[str | None] = ()) -> Path | None:
+    excluded = {str(Path(path)) for path in excluded_paths if path}
     candidates = [
         p
         for p in case_dir.iterdir()
-        if _is_image_file(p) and MODALITY_SUFFIX_RE.search(p.name) is None
+        if _is_image_file(p) and str(p) not in excluded and infer_modality(p) is None
     ]
     if not candidates:
         return None
@@ -106,29 +253,112 @@ def find_segmentation_file(case_dir: Path) -> Path | None:
 
     candidates.sort(key=score, reverse=True)
     for candidate in candidates:
-        if _looks_like_label_volume(candidate):
+        try:
+            if _looks_like_label_volume(candidate):
+                return candidate
+        except ImportError:
+            continue
+    if sitk is None:
+        return None
+    for candidate in candidates:
+        if candidate.name.lower().endswith(SEG_EXTENSIONS):
             return candidate
-    return candidates[0]
+    return None
 
 
-def discover_cases(data_dir: Path) -> list[VisitRecord]:
+def _contains_images(path: Path) -> bool:
+    if not path.is_dir() or path.name.startswith("."):
+        return False
+    return any(_is_image_file(item) for item in path.iterdir())
+
+
+def _contains_modalities(path: Path, modality_classifier: ModalityClassifier | None = None) -> bool:
+    if not _contains_images(path):
+        return False
+    if modality_classifier is not None:
+        return True
+    return any(_is_image_file(item) and infer_modality(item) is not None for item in path.iterdir())
+
+
+def _visit_sort_key(path: Path) -> tuple[int, str]:
+    text = path.name.lower()
+    date_match = DATE_RE.search(text)
+    if date_match:
+        digits = re.sub(r"\D", "", date_match.group(0))
+        return int(digits), path.name
+    visit_match = VISIT_RE.search(text)
+    if visit_match:
+        raw = visit_match.group(2)
+        if raw.isdigit():
+            return int(raw), path.name
+        return 10_000 + sum(ord(char) for char in raw), path.name
+    return 1_000_000, path.name
+
+
+def _visit_id(path: Path, patient_dir: Path) -> str:
+    if path == patient_dir:
+        return "baseline"
+    return path.relative_to(patient_dir).as_posix().replace("/", "__")
+
+
+def _visit_delta_months(visit_dir: Path, ordered_visit_dirs: Sequence[Path]) -> float:
+    index = ordered_visit_dirs.index(visit_dir)
+    key = _visit_sort_key(visit_dir)[0]
+    first_key = _visit_sort_key(ordered_visit_dirs[0])[0]
+    if 19_000_000 <= key <= 20_999_999 and 19_000_000 <= first_key <= 20_999_999:
+        from datetime import datetime
+
+        current = datetime.strptime(str(key), "%Y%m%d")
+        first = datetime.strptime(str(first_key), "%Y%m%d")
+        return max(0.0, (current - first).days / 30.4375)
+    return float(index)
+
+
+def _discover_visit_dirs(patient_dir: Path, modality_classifier: ModalityClassifier | None = None) -> list[Path]:
+    visit_dirs = [patient_dir] if _contains_modalities(patient_dir, modality_classifier) else []
+    for child in sorted(patient_dir.rglob("*")):
+        if child == patient_dir or not child.is_dir() or child.name.startswith("."):
+            continue
+        if _contains_modalities(child, modality_classifier):
+            visit_dirs.append(child)
+    return sorted(set(visit_dirs), key=_visit_sort_key)
+
+
+def discover_cases(
+    data_dir: Path,
+    modality_classifier: ModalityClassifier | None = None,
+    classifier_threshold: float = 0.70,
+) -> list[VisitRecord]:
     records: list[VisitRecord] = []
-    for case_dir in sorted(data_dir.iterdir()):
-        if not case_dir.is_dir() or case_dir.name.startswith("."):
+    patient_dirs = [p for p in sorted(data_dir.iterdir()) if p.is_dir() and not p.name.startswith(".")]
+    if _contains_modalities(data_dir, modality_classifier):
+        patient_dirs.insert(0, data_dir)
+    for patient_dir in patient_dirs:
+        visit_dirs = _discover_visit_dirs(patient_dir, modality_classifier)
+        if not visit_dirs:
             continue
-        modalities = discover_modalities(case_dir)
-        if not any(modalities):
-            continue
-        mask_path = find_segmentation_file(case_dir)
-        records.append(
-            VisitRecord(
-                patient_id=case_dir.name,
-                visit_id="baseline",
-                delta_t=0.0,
-                modalities=modalities,
-                mask_path=str(mask_path) if mask_path is not None else None,
+        previous_mask_path: str | None = None
+        for visit_dir in visit_dirs:
+            modalities = discover_modalities(
+                visit_dir,
+                modality_classifier=modality_classifier,
+                classifier_threshold=classifier_threshold,
             )
-        )
+            if not any(modalities):
+                continue
+            mask_path = find_segmentation_file(visit_dir, excluded_paths=modalities)
+            records.append(
+                VisitRecord(
+                    patient_id=patient_dir.name,
+                    visit_id=_visit_id(visit_dir, patient_dir),
+                    delta_t=_visit_delta_months(visit_dir, visit_dirs),
+                    modalities=modalities,
+                    mask_path=str(mask_path) if mask_path is not None else None,
+                    previous_mask_path=previous_mask_path,
+                )
+            )
+            if mask_path is not None:
+                previous_mask_path = str(mask_path)
     return records
 
 

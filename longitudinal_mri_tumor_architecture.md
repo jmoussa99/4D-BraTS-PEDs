@@ -2,24 +2,26 @@
 
 ## Goal
 
-Design a longitudinal brain MRI model that takes multiparametric MRI sequences across visits and produces temporally consistent tumor segmentations. The segmentations are then converted into quantitative tumor-evolution features for growth, treatment response, progression, and survival modeling.
+Design a longitudinal pediatric brain MRI model that takes multiparametric MRI sequences across visits and produces temporally consistent tumor subregion segmentations. The primary output is a NIfTI trajectory of tumor label maps. Those segmentations can then be converted into quantitative tumor-evolution features for growth, treatment response, progression, and survival modeling when those downstream labels are available.
 
-The proposed architecture is named `LongiTumorMamba`.
+The proposed architecture is named `OmniMamba4DMRI`. `LongiTumorMamba` can remain as a project-level wrapper when adding optional tumor-evolution heads.
 
 ## Paper-Derived Design Principles
 
 This design synthesizes four ideas from the provided papers:
 
-- **Robust missing-sequence segmentation**: The pediatric brain tumor paper showed that modality dropout during segmentation training was more robust than synthesis, copy substitution, or zero-filled inputs when FLAIR or T1-weighted sequences were missing. `LongiTumorMamba` uses modality dropout as the primary missing-modality strategy rather than relying on image synthesis as a required preprocessing step.
-- **4D spatio-temporal modeling**: OmniMamba4D treats longitudinal imaging as a 4D input, using Mamba blocks to capture spatial and temporal dependencies efficiently. `LongiTumorMamba` adopts this principle for longitudinal MRI, processing tensors shaped as `(B, T, M, D, H, W)`.
-- **Previous-mask shape guidance**: MambaX-Net improves longitudinal segmentation by conditioning the current segmentation on the previous scan and previous mask. `LongiTumorMamba` adds a shape-memory branch that uses prior predicted or manual masks to stabilize boundaries and reduce temporal flicker.
-- **Efficient hybrid staging**: SegMaFormer uses Mamba layers where token sequences are long and attention where tokens are compact. `LongiTumorMamba` follows this staged design to keep high-resolution processing efficient while still using attention at low resolution for global tumor and anatomy context.
+- **Robust missing-sequence segmentation**: The pediatric brain tumor paper showed that modality dropout during segmentation training was more robust than synthesis, copy substitution, or zero-filled inputs when FLAIR or pre-contrast T1-weighted sequences were missing. `LongiTumorMamba` uses modality dropout as the primary missing-modality strategy rather than relying on image synthesis as a required preprocessing step.
+- **4D spatio-temporal modeling**: OmniMamba4D treats longitudinal imaging as a 4D input, using Mamba blocks to capture spatial and temporal dependencies efficiently. `OmniMamba4DMRI` adopts this as the core architecture for longitudinal MRI, processing tensors shaped as `(B, T, M, D, H, W)` in the loader and as `(B, M, T, D, H, W)` conceptually in the OmniMamba4D paper.
+- **Previous-mask shape guidance**: MambaX-Net improves longitudinal prostate MRI segmentation by conditioning the current segmentation on the previous scan and previous mask. This should be an optional extension, not the first-pass architecture, because the main implementation should stay close to OmniMamba4D.
+- **Efficient hybrid staging**: SegMaFormer uses Mamba layers where token sequences are long and attention where tokens are compact for 3D medical segmentation. This is also an optional extension; the primary model should first reproduce the OmniMamba4D-style encoder and CNN decoder for MRI.
+
+The pediatric brain tumor evidence directly supports the input sequences, tumor subregions, nnU-Net backbone, modality dropout for FLAIR/T1w-pre missingness, and downstream time-varying Cox modeling from tumor volumes. The OmniMamba4D encoder is the main architecture transfer. Shape-memory and hybrid attention pieces are secondary extensions and should be validated by ablation after the OmniMamba4D baseline works.
 
 ## Input and Output
 
 ### Input
 
-The primary input is a longitudinal multiparametric MRI tensor:
+The raw input is a set of longitudinal NIfTI volumes (`.nii` or `.nii.gz`) organized by patient, visit timestamp, and MRI sequence. Filenames do not need to use BraTS/nnU-Net `_0000.._0003` suffixes. The manifest builder should first infer modalities from common clinical filename tokens such as `T1w`, `T1_pre`, `T1w_post`, `T1ce`, `T2w`, and `FLAIR`, while still accepting `_0000.._0003` as a fallback. If filenames and sidecar metadata are not reliable, run a separate MRI-sequence classifier from image content and write the manifest only when confidence passes a configured threshold. After loading, registration, resampling, normalization, and cropping, the primary tensor is:
 
 ```text
 X: (B, T, M, D, H, W)
@@ -29,7 +31,7 @@ Where:
 
 - `B` is batch size.
 - `T` is the number of timepoints or visits.
-- `M` is the MRI sequence count: `T1`, `T2`, `T1c`, and `FLAIR`.
+- `M` is the MRI sequence count: `T1`, `T2`, `T1c`, and `FLAIR`. In the pediatric paper's terminology, `T1` corresponds to pre-contrast T1w and `T1c` corresponds to post-contrast T1w.
 - `D`, `H`, and `W` are the 3D volume dimensions after registration, resampling, and cropping.
 
 The model also accepts optional metadata:
@@ -38,40 +40,45 @@ The model also accepts optional metadata:
 delta_t: (B, T)
 available_modalities: (B, T, M)
 clinical_covariates: age, sex, treatment group, diagnosis, molecular markers when available
-previous_masks: (B, T, 4, D, H, W)
+previous_label_maps: (B, T, D, H, W)
+previous_mask_probs: optional (B, T, 5, D, H, W)
 ```
 
 `delta_t` is important because clinical visits are usually irregularly spaced. The model should learn tumor evolution per unit time, not only per index in the scan sequence.
 
 ### Output
 
-The model outputs:
+The model outputs temporally indexed tumor segmentations:
 
 ```text
-Y_hat: (B, T, 4, D, H, W)
+P_hat: (B, T, 4, D, H, W)
+Y_hat: (B, T, D, H, W)
 trajectory_embedding: (B, T, E)
-evolution_outputs: growth rate, response state, progression risk, survival risk
+evolution_outputs: optional growth rate, response state, progression risk, survival risk
 ```
 
-The segmentation output is a 3D tumor volume with four modality-aligned channels:
+`P_hat` stores foreground probabilities for the four requested tumor labels. `Y_hat` is the exported integer segmentation volume for each timestamp:
 
-- `Y_hat[:, :, 0]`: tumor segmentation volume aligned to `T1`
-- `Y_hat[:, :, 1]`: tumor segmentation volume aligned to `T2`
-- `Y_hat[:, :, 2]`: tumor segmentation volume aligned to `T1c`
-- `Y_hat[:, :, 3]`: tumor segmentation volume aligned to `FLAIR`
+- `0`: background
+- `1`: enhancing tumor
+- `2`: non-enhancing tumor
+- `3`: cyst
+- `4`: edema
 
-For a single patient at a single timepoint, the segmentation can be represented as `(4, D, H, W)`. Each channel can store either a binary tumor mask or a tumor probability map for that MRI sequence. A final fused tumor volume can be obtained by averaging, voting, or applying a learned fusion layer across the four modality-aligned channels.
+For a single patient at a single timepoint, the exported segmentation is a 3D label map `(D, H, W)` saved as NIfTI. If a training loop needs channelized targets, convert the label map to foreground channel form `(4, D, H, W)`. The four MRI sequences are input channels only; they are not output classes.
+
+The core segmentation head predicts label maps at the observed MRI timestamps. Future segmentation generation or tumor-trajectory forecasting can be added as an optional head, but it requires future-mask supervision or a separate forecasting objective and is not directly validated by the supplied papers.
 
 ## Architecture Overview
 
-`LongiTumorMamba` has six stages:
+`OmniMamba4DMRI` has six core stages:
 
 1. **Longitudinal MRI preprocessing**
-2. **Modality-aware input encoding**
+2. **Modality-aware input encoding and dropout**
 3. **Shared 3D local encoder**
-4. **Spatio-temporal Mamba encoder**
-5. **Shape-memory and temporal consistency decoder**
-6. **Tumor-evolution modeling head**
+4. **Tetra-oriented spatio-temporal Mamba encoder**
+5. **CNN decoder with per-timepoint segmentation heads**
+6. **Optional tumor-evolution modeling head**
 
 ```mermaid
 flowchart TD
@@ -80,12 +87,9 @@ flowchart TD
     inputTensor --> modalityGate["Availability mask and modality dropout"]
     modalityGate --> localEncoder["Shared 3D local encoder"]
     localEncoder --> temporalMamba["Spatio-temporal Mamba encoder"]
-    temporalMamba --> lowResAttention["Compact cross-time attention"]
-    previousMasks["Previous masks or prior predictions"] --> shapeMemory["Shape-memory encoder"]
-    shapeMemory --> decoder["Temporal consistency decoder"]
-    lowResAttention --> decoder
+    temporalMamba --> decoder["CNN decoder, shared across visits"]
     localEncoder --> decoder
-    decoder --> segMasks["Per-timepoint tumor masks"]
+    decoder --> segMasks["Per-timepoint 4-label tumor masks"]
     segMasks --> featureExtractor["Volume, radiomics, morphology"]
     temporalMamba --> latentTrajectory["Latent trajectory embeddings"]
     featureExtractor --> evolutionHead["Tumor-evolution model"]
@@ -102,16 +106,45 @@ Preprocessing should produce aligned, intensity-normalized longitudinal volumes 
 
 Recommended pipeline:
 
-1. Convert DICOM to NIfTI and organize by patient, visit, and sequence.
-2. Register sequences within each visit to a reference sequence, usually T1c or T2.
-3. Register visits to a baseline or atlas space using rigid or affine registration first.
-4. Use deformable registration cautiously. It can improve alignment, but it may also hide real tumor growth or shrinkage if applied too aggressively.
-5. Resample to a common spacing, such as 1 mm isotropic when feasible.
-6. Skull-strip if the chosen backbone expects it.
-7. Z-score normalize nonzero voxels per sequence and per visit.
-8. Crop around brain or tumor region for training; preserve full-volume inference through sliding windows.
+1. Start from NIfTI (`.nii` or `.nii.gz`) and organize by patient and visit timestamp. If raw data arrive as DICOM, convert to NIfTI before this pipeline and preserve DICOM/BIDS sidecar metadata when possible.
+2. Build a manifest with one row per patient visit and ordered columns `t1`, `t2`, `t1c`, `flair`.
+3. Identify modality by metadata or filename tokens when available. If neither is reliable, classify each candidate volume with the MRI-sequence classifier and accept predictions above the confidence threshold.
+4. Flag incomplete or ambiguous visits for manual review instead of silently assigning uncertain channels.
+5. Register sequences within each visit to a reference sequence, usually T1c/T1w-post or T2.
+6. Register visits to a baseline or atlas space using rigid or affine registration first.
+7. Use deformable registration cautiously. It can improve alignment, but it may also hide real tumor growth or shrinkage if applied too aggressively.
+8. Resample to a common spacing, such as 1 mm isotropic when feasible.
+9. Skull-strip if the chosen backbone expects it.
+10. Z-score normalize nonzero voxels per sequence and per visit.
+11. Crop around brain or tumor region for training; preserve full-volume inference through sliding windows.
 
 Store an `available_modalities` mask for every visit. Missing or corrupted sequences should be explicitly represented instead of silently replaced.
+
+### 1a. MRI-Sequence Classifier
+
+OmniMamba4D does not infer MRI sequence identity. The sequence classifier is a separate preprocessing model used only to assign anonymous volumes before segmentation.
+
+Recommended behavior:
+
+- Use a local clone of `https://github.com/JinqianPan/MRISeqClassifier`.
+- Download its pretrained best models into `MRISeqClassifier/02_models/best_model` as described by its README.
+- During manifest creation, export representative axial slices from each anonymous NIfTI/MHA volume, call MRISeqClassifier's `05_toolkit.py`, and majority-vote slice predictions into one volume-level prediction.
+- Require a confidence threshold, initially `0.70`, and send low-confidence or duplicate assignments to manual review.
+- Validate downstream segmentation sensitivity by intentionally swapping or corrupting modality assignments on a validation set.
+
+Important limitation: the upstream pretrained MRISeqClassifier toolkit predicts `DTI`, `DWI`, `FLAIR`, `OTHER`, `T1`, and `T2`. It does not separate pre-contrast `T1` from post-contrast `T1c` unless you retrain or fine-tune it with an explicit `T1c`/`T1CE` class. For this project, classifier-derived `T1c` assignments should only be trusted when using a custom MRISeqClassifier model that includes that label.
+
+Example commands:
+
+```text
+git clone https://github.com/JinqianPan/MRISeqClassifier.git external/MRISeqClassifier
+# download best models into external/MRISeqClassifier/02_models/best_model
+python scripts/create_manifest.py \
+  --data-dir data \
+  --output longitumor_manifest.csv \
+  --mriseqclassifier-repo external/MRISeqClassifier \
+  --classifier-threshold 0.70
+```
 
 ### 2. Modality-Aware Input Encoding
 
@@ -135,7 +168,7 @@ Initial dropout values:
 - `p_t2 = 0.1`
 - `p_t1c = 0.1`
 
-The pediatric brain tumor paper found `p = 0.4` effective for FLAIR and T1-weighted dropout. Extending lower-probability dropout to T2 and T1c makes the model more robust without overtraining on unlikely missingness patterns.
+The pediatric brain tumor paper found `p = 0.4` effective for independent FLAIR and pre-contrast T1w dropout. Extending lower-probability dropout to T2 and T1c is a proposed robustness extension for this project, not a result directly evaluated in that paper.
 
 The input encoder should concatenate image channels and learned modality embeddings:
 
@@ -205,14 +238,14 @@ For memory efficiency:
 - Use gradient checkpointing for long sequences.
 - Train on cropped patches and infer with sliding windows.
 
-### 5. Shape-Memory Branch
+### 5. Optional Shape-Memory Branch
 
-The shape-memory branch stabilizes segmentation across visits by encoding prior masks. It is inspired by MambaX-Net's shape extractor, but adapted for tumor segmentation.
+The shape-memory branch stabilizes segmentation across visits by encoding prior masks. It is inspired by MambaX-Net's shape extractor, but adapted for tumor segmentation. Keep this disabled for the first OmniMamba4D-style MRI baseline.
 
 Inputs:
 
 ```text
-M_prev: previous manual mask, pseudo-label, or model prediction
+M_prev: previous manual 4-label map, pseudo-label, or model prediction
 I_prev: previous MRI visit
 I_curr: current MRI visit
 ```
@@ -233,13 +266,13 @@ Use this branch in two modes:
 
 Sequential mode is important for real deployment because patients arrive visit by visit. It also helps when some patients have only two scans.
 
-### 6. Temporal Consistency Decoder
+### 6. OmniMamba4D-Style CNN Decoder
 
-The decoder reconstructs one segmentation per timepoint. It combines:
+The decoder reconstructs one segmentation per timepoint from the spatio-temporal features, following OmniMamba4D's CNN decoder idea. In the core baseline it combines:
 
 - Same-timepoint skip connections for boundary detail.
 - Cross-time Mamba features for temporal context.
-- Shape-memory features from previous masks.
+- Optional shape-memory features from previous masks only when that extension is enabled.
 
 Temporal consistency should be encouraged but not forced. Tumors can genuinely grow, shrink, disappear, or transform after treatment.
 
@@ -252,7 +285,8 @@ The decoder should learn consistency through soft constraints:
 Output:
 
 ```text
-Y_hat_t = Decoder(F_t, F_temporal_t, S_prev_t)
+P_hat_t = Decoder(F_t, F_temporal_t, S_prev_t)
+Y_hat_t = argmax(P_hat_t)
 ```
 
 ### 7. Tumor-Evolution Modeling Head
@@ -260,11 +294,11 @@ Y_hat_t = Decoder(F_t, F_temporal_t, S_prev_t)
 After segmentation, compute per-timepoint quantitative features:
 
 ```text
-V_t1_t
-V_t2_t
-V_t1c_t
-V_flair_t
-V_fused_t
+V_enhancing_t
+V_non_enhancing_t
+V_cyst_t
+V_edema_t
+V_whole_t
 surface_area_t
 centroid_t
 compactness_t
@@ -279,7 +313,7 @@ Convert these into temporal features:
 absolute_volume_change = V_t - V_t_minus_1
 relative_volume_change = (V_t - V_t_minus_1) / max(V_t_minus_1, epsilon)
 monthly_growth_rate = relative_volume_change / delta_months
-modality_volume_delta = modality_volume_fraction_t - modality_volume_fraction_t_minus_1
+label_volume_delta = label_volume_fraction_t - label_volume_fraction_t_minus_1
 centroid_shift = distance(centroid_t, centroid_t_minus_1)
 ```
 
@@ -307,7 +341,7 @@ Train the 3D local encoder and decoder on all available labeled scans, treating 
 Objective:
 
 ```text
-L_seg = DiceCE(Y_hat_t, Y_t)
+L_seg = DiceCE(P_hat_t, Y_t)
 ```
 
 Use nnU-Net-style training:
@@ -367,7 +401,7 @@ The goal is to discourage implausible mask flicker without suppressing true biol
 Use a soft warped consistency term:
 
 ```text
-L_temporal = mean_t DiceDistance(Y_hat_t, Warp(Y_hat_t_minus_1))
+L_temporal = mean_t DiceDistance(P_hat_t, Warp(P_hat_t_minus_1))
 ```
 
 Weight by visit interval and image evidence:
@@ -383,7 +417,7 @@ Large time gaps should impose weaker consistency. Strong image changes should al
 When previous masks are available:
 
 ```text
-L_shape = BoundaryDistance(Y_hat_t, ShapeGuidedPrediction_t)
+L_shape = BoundaryDistance(P_hat_t, ShapeGuidedPrediction_t)
 ```
 
 This can be implemented as a boundary loss, Hausdorff-style loss, or signed distance transform loss. It should mainly improve boundaries and prevent sudden implausible shape jumps.
@@ -421,7 +455,7 @@ Avoid blindly adding all pseudo-labels. The MambaX-Net paper showed that dual-sc
 
 ### Segmentation Metrics
 
-Report per class and aggregate:
+Report per foreground class and aggregate:
 
 - Dice score
 - Hausdorff distance at 95th percentile
@@ -429,12 +463,15 @@ Report per class and aggregate:
 - Sensitivity and precision
 - Volume similarity
 
+Primary foreground classes are enhancing tumor, non-enhancing tumor, cyst, and edema. Also report derived whole tumor (WT) as the union of foreground labels, matching the pediatric paper's use of tumor-volume summaries.
+
 Evaluate both complete and missing-sequence settings:
 
 - All sequences available
 - Missing FLAIR
-- Missing T1
-- Missing FLAIR and T1
+- Missing T1/pre-contrast T1w
+- Missing FLAIR and T1/pre-contrast T1w
+- Optional project extension: missing T2 or T1c/post-contrast T1w
 - Artifact-corrupted sequence replaced by zero and marked unavailable
 
 ### Temporal Consistency Metrics
@@ -537,6 +574,7 @@ Recommended starting configuration:
 ```text
 Input patch: 96 x 160 x 160 or hardware-dependent nnU-Net patch
 Sequences: T1, T2, T1c, FLAIR
+Output labels: background, enhancing tumor, non-enhancing tumor, cyst, edema
 Timepoints: 2 to 4 per patient during training
 Optimizer: AdamW or SGD with nnU-Net schedule
 Batch size: 1 to 2 longitudinal samples

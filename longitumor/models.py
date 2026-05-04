@@ -22,6 +22,8 @@ class LongiTumorMambaConfig:
     clinical_dim: int = 0
     modality_dropout: tuple[float, float, float, float] = (0.4, 0.1, 0.1, 0.4)
     use_mamba: bool = True
+    use_bottleneck_attention: bool = False
+    use_shape_memory: bool = False
 
 
 @dataclass
@@ -124,6 +126,8 @@ class TemporalTetraMambaBlock(nn.Module):
         self.fuse = nn.Linear(channels * 4, channels)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Mix 4D features in the OmniMamba4D tetra-oriented directions."""
+
         b, t, c, d, h, w = features.shape
         tokens = features.permute(0, 1, 3, 4, 5, 2).reshape(b, t * d * h * w, c)
         fwd = self.forward_mixer(tokens)
@@ -213,9 +217,17 @@ class LongiTumorMamba(nn.Module):
         self.input_embedding = nn.Parameter(torch.zeros(1, 1, self.config.in_modalities, 1, 1, 1))
         self.encoder = Local3DEncoder(input_channels, channels)
         self.temporal = TemporalTetraMambaBlock(channels[-1], use_mamba=self.config.use_mamba)
-        self.bottleneck_attention = nn.MultiheadAttention(channels[-1], num_heads=4, batch_first=True)
-        self.shape_memory = ShapeMemoryBranch(self.config.out_channels, channels[-1])
-        self.shape_fuse = nn.Conv3d(channels[-1] * 2, channels[-1], kernel_size=1)
+        self.bottleneck_attention = (
+            nn.MultiheadAttention(channels[-1], num_heads=4, batch_first=True)
+            if self.config.use_bottleneck_attention
+            else None
+        )
+        self.shape_memory = (
+            ShapeMemoryBranch(self.config.out_channels, channels[-1])
+            if self.config.use_shape_memory
+            else None
+        )
+        self.shape_fuse = nn.Conv3d(channels[-1] * 2, channels[-1], kernel_size=1) if self.config.use_shape_memory else None
         self.decoder = TemporalDecoder(channels, self.config.out_channels)
         self.trajectory = nn.Linear(channels[-1], self.config.embedding_dim)
         self.evolution = EvolutionHead(self.config.embedding_dim, self.config.clinical_dim)
@@ -244,12 +256,16 @@ class LongiTumorMamba(nn.Module):
         bd, bh, bw = bottleneck.shape[-3:]
 
         pooled = bottleneck.flatten(3).mean(dim=-1)
-        attended, _ = self.bottleneck_attention(pooled, pooled, pooled)
-        trajectory = self.trajectory(attended)
-        bottleneck = bottleneck + attended[..., None, None, None]
+        if self.bottleneck_attention is not None:
+            attended, _ = self.bottleneck_attention(pooled, pooled, pooled)
+            trajectory_source = attended
+            bottleneck = bottleneck + attended[..., None, None, None]
+        else:
+            trajectory_source = pooled
+        trajectory = self.trajectory(trajectory_source)
 
-        shape_features = self.shape_memory(previous_masks, (bd, bh, bw))
-        if shape_features is not None:
+        shape_features = self.shape_memory(previous_masks, (bd, bh, bw)) if self.shape_memory is not None else None
+        if shape_features is not None and self.shape_fuse is not None:
             bottleneck = self.shape_fuse(
                 torch.cat(
                     [
@@ -285,3 +301,9 @@ class LongiTumorMamba(nn.Module):
             zero = torch.zeros_like(previous_mask)
             previous_masks = torch.stack([zero, previous_mask], dim=1)
         return self.forward(x, previous_masks=previous_masks, **kwargs)
+
+
+class OmniMamba4DMRI(LongiTumorMamba):
+    """MRI adaptation of OmniMamba4D with optional missing-modality handling."""
+
+    pass
