@@ -3,6 +3,7 @@
 # Python/local environment
 .venv/
 venv/
+.venv-nnunet/
 env/
 __pycache__/
 *.py[cod]
@@ -15,7 +16,26 @@ __pycache__/
 data/
 brain_tumor_dimension/
 bran_tumor_dimension/
-tumor_measurements_by_case.csv
+trial/
+trial_pediatric_masks*/
+predicted_masks/
+nnunet_raw/
+nnunet_preprocessed/
+nnunet_results/
+pediatric_model/data/
+pediatric_model/
+pediatric_model/postProcessing/outputWT/
+pediatric_model/postProcessing/output3L/
+pediatric_model/postProcessing/relabeled/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.zip
+*.npy
+*.npz
+*.pkl
+*.pickle
 
 # Medical imaging/raw data files
 *.mha

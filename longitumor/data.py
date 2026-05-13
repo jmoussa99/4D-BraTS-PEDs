@@ -32,6 +32,8 @@ SEG_EXTENSIONS = (".nii", ".nii.gz", ".mha")
 PREFERRED_SEG_TOKENS = ("REVISED", "UPDATED", "v2", "V2", "my_", "MY_", "ens", "ENS", "E-", "E_")
 MAX_SEG_UNIQUE_VALUES = 16
 DATE_RE = re.compile(r"(?:19|20)\d{2}[-_]?\d{2}[-_]?\d{2}|(?:19|20)\d{6}")
+DAYS_RE = re.compile(r"^(\d+)d(?:[_\-\s]|$)", re.IGNORECASE)
+SERIES_DIR_RE = re.compile(r"^\d{1,4}\s+[-_]\s+")
 VISIT_RE = re.compile(r"(?:^|[_\-\s])(visit|timepoint|tp|scan|study|ses|session|fu|followup)[_\-\s]*([a-z0-9]+)", re.IGNORECASE)
 SEGMENTATION_TOKENS = {
     "seg",
@@ -51,6 +53,10 @@ SEGMENTATION_TOKENS = {
 MODALITY_ALIASES = {
     "flair": {
         "flair",
+        "tirm",
+        "darkfluid",
+        "dark_fluid",
+        "dark-fluid",
         "t2flair",
         "t2_flair",
         "t2-flair",
@@ -131,6 +137,15 @@ def _is_image_file(path: Path) -> bool:
     return path.is_file() and not path.name.startswith(".") and name.endswith(SEG_EXTENSIONS)
 
 
+def _is_metadata_dir(path: Path) -> bool:
+    return path.name.startswith(".") or path.name == "__MACOSX"
+
+
+def _iter_image_files(path: Path, recursive: bool = False) -> Iterable[Path]:
+    items = path.rglob("*") if recursive else path.iterdir()
+    return (item for item in items if _is_image_file(item))
+
+
 def _strip_image_suffix(name: str) -> str:
     lower = name.lower()
     for suffix in (".nii.gz", ".nii", ".mha"):
@@ -151,6 +166,12 @@ def _tokens(path: Path) -> set[str]:
     return tokens
 
 
+def _looks_like_segmentation_name(path: Path) -> bool:
+    toks = _tokens(path)
+    preferred = {token.lower() for token in PREFERRED_SEG_TOKENS if len(token) > 2}
+    return bool(toks & SEGMENTATION_TOKENS or any(token in path.name.lower() for token in preferred))
+
+
 def infer_modality(path: Path) -> str | None:
     """Infer MRI modality from a NIfTI/MHA filename.
 
@@ -161,6 +182,8 @@ def infer_modality(path: Path) -> str | None:
     toks = _tokens(path)
     if toks & SEGMENTATION_TOKENS:
         return None
+    if (toks & MODALITY_ALIASES["t1"]) and {"post", "gad", "gd", "contrast", "enhanced"} & toks:
+        return "t1c"
     for modality in ("flair", "t1c", "t2", "t1"):
         if toks & MODALITY_ALIASES[modality]:
             return modality
@@ -175,7 +198,7 @@ def _modality_score(path: Path, modality: str) -> tuple[int, int, str]:
     exact = int(modality in toks)
     alias_hits = len(toks & MODALITY_ALIASES[modality])
     numeric = int(MODALITY_SUFFIX_RE.search(path.name) is not None)
-    return exact + alias_hits + numeric, -path.stat().st_size, path.name
+    return exact + alias_hits + numeric, path.stat().st_size, path.name
 
 
 ModalityClassifier = Callable[[Path], tuple[str, float]]
@@ -191,9 +214,7 @@ def discover_modalities(
     paths: list[str | None] = [None] * len(MODALITY_NAMES)
     candidates: dict[str, list[Path]] = {name: [] for name in MODALITY_NAMES}
     classifier_scores: dict[Path, float] = {}
-    for item in case_dir.iterdir():
-        if not _is_image_file(item):
-            continue
+    for item in _iter_image_files(case_dir, recursive=True):
         modality = infer_modality(item)
         if modality is None and modality_classifier is not None:
             try:
@@ -241,8 +262,11 @@ def find_segmentation_file(case_dir: Path, excluded_paths: Sequence[str | None] 
     excluded = {str(Path(path)) for path in excluded_paths if path}
     candidates = [
         p
-        for p in case_dir.iterdir()
-        if _is_image_file(p) and str(p) not in excluded and infer_modality(p) is None
+        for p in _iter_image_files(case_dir, recursive=True)
+        if _is_image_file(p)
+        and str(p) not in excluded
+        and infer_modality(p) is None
+        and _looks_like_segmentation_name(p)
     ]
     if not candidates:
         return None
@@ -267,9 +291,9 @@ def find_segmentation_file(case_dir: Path, excluded_paths: Sequence[str | None] 
 
 
 def _contains_images(path: Path) -> bool:
-    if not path.is_dir() or path.name.startswith("."):
+    if not path.is_dir() or _is_metadata_dir(path):
         return False
-    return any(_is_image_file(item) for item in path.iterdir())
+    return any(_iter_image_files(path))
 
 
 def _contains_modalities(path: Path, modality_classifier: ModalityClassifier | None = None) -> bool:
@@ -277,7 +301,21 @@ def _contains_modalities(path: Path, modality_classifier: ModalityClassifier | N
         return False
     if modality_classifier is not None:
         return True
-    return any(_is_image_file(item) and infer_modality(item) is not None for item in path.iterdir())
+    return any(infer_modality(item) is not None for item in _iter_image_files(path))
+
+
+def _looks_like_visit_dir(path: Path, modality_classifier: ModalityClassifier | None = None) -> bool:
+    if _contains_modalities(path, modality_classifier):
+        return True
+    if not path.is_dir() or _is_metadata_dir(path):
+        return False
+    return any(
+        child.is_dir()
+        and not _is_metadata_dir(child)
+        and SERIES_DIR_RE.search(child.name)
+        and _contains_modalities(child, modality_classifier)
+        for child in path.iterdir()
+    )
 
 
 def _visit_sort_key(path: Path) -> tuple[int, str]:
@@ -286,6 +324,9 @@ def _visit_sort_key(path: Path) -> tuple[int, str]:
     if date_match:
         digits = re.sub(r"\D", "", date_match.group(0))
         return int(digits), path.name
+    days_match = DAYS_RE.search(text)
+    if days_match:
+        return int(days_match.group(1)), path.name
     visit_match = VISIT_RE.search(text)
     if visit_match:
         raw = visit_match.group(2)
@@ -311,17 +352,30 @@ def _visit_delta_months(visit_dir: Path, ordered_visit_dirs: Sequence[Path]) -> 
         current = datetime.strptime(str(key), "%Y%m%d")
         first = datetime.strptime(str(first_key), "%Y%m%d")
         return max(0.0, (current - first).days / 30.4375)
+    if key < 1_000_000 and first_key < 1_000_000:
+        return max(0.0, (key - first_key) / 30.4375)
     return float(index)
 
 
 def _discover_visit_dirs(patient_dir: Path, modality_classifier: ModalityClassifier | None = None) -> list[Path]:
-    visit_dirs = [patient_dir] if _contains_modalities(patient_dir, modality_classifier) else []
+    visit_dirs = [patient_dir] if _looks_like_visit_dir(patient_dir, modality_classifier) else []
     for child in sorted(patient_dir.rglob("*")):
-        if child == patient_dir or not child.is_dir() or child.name.startswith("."):
+        if child == patient_dir or not child.is_dir() or _is_metadata_dir(child):
             continue
-        if _contains_modalities(child, modality_classifier):
+        if any(parent in visit_dirs for parent in child.parents):
+            continue
+        if _looks_like_visit_dir(child, modality_classifier):
             visit_dirs.append(child)
     return sorted(set(visit_dirs), key=_visit_sort_key)
+
+
+def _patient_dirs(data_dir: Path, modality_classifier: ModalityClassifier | None = None) -> list[Path]:
+    dirs = [p for p in sorted(data_dir.iterdir()) if p.is_dir() and not _is_metadata_dir(p)]
+    if len(dirs) == 1 and not _looks_like_visit_dir(dirs[0], modality_classifier):
+        nested = [p for p in sorted(dirs[0].iterdir()) if p.is_dir() and not _is_metadata_dir(p)]
+        if nested and any(any(visit != p for visit in _discover_visit_dirs(p, modality_classifier)) for p in nested):
+            return nested
+    return dirs
 
 
 def discover_cases(
@@ -330,7 +384,7 @@ def discover_cases(
     classifier_threshold: float = 0.70,
 ) -> list[VisitRecord]:
     records: list[VisitRecord] = []
-    patient_dirs = [p for p in sorted(data_dir.iterdir()) if p.is_dir() and not p.name.startswith(".")]
+    patient_dirs = _patient_dirs(data_dir, modality_classifier)
     if _contains_modalities(data_dir, modality_classifier):
         patient_dirs.insert(0, data_dir)
     for patient_dir in patient_dirs:

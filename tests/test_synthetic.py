@@ -6,7 +6,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from longitumor.data import discover_cases, discover_modalities, infer_modality, labels_to_channels, random_patch_slices
+from longitumor.data import VisitRecord, discover_cases, discover_modalities, infer_modality, labels_to_channels, random_patch_slices
+from longitumor.inference import predict_visit_mask
 from longitumor.models import LongiTumorMamba, LongiTumorMambaConfig
 from longitumor.training import DiceBCELoss
 
@@ -70,6 +71,32 @@ def test_discover_cases_from_nested_visits(tmp_path) -> None:
     assert all(all(record.modalities) for record in records)
 
 
+def test_discover_cases_from_trial_style_series_folders(tmp_path) -> None:
+    patient = tmp_path / "trial" / "C75768"
+    visit = patient / "5665d_B_brain_21h15m"
+    series = {
+        "02 - t1_mprage_tra_p2_iso_1.0": "t1_mprage_tra_p2_iso_1.0.nii.gz",
+        "03 - t2_spc_tra_p2_iso_1.0": "t2_spc_tra_p2_iso_1.0.nii.gz",
+        "04 - t2_tirm_tra_dark_p2_brain": "t2_tirm_tra_dark_p2_brain.nii.gz",
+        "05 - t1_mprage_tra_p2_iso_1.0_POST": "t1_mprage_tra_p2_iso_1.0_POST.nii.gz",
+    }
+    for folder, filename in series.items():
+        series_dir = visit / folder
+        series_dir.mkdir(parents=True)
+        (series_dir / filename).touch()
+
+    records = discover_cases(tmp_path)
+    assert len(records) == 1
+    assert records[0].patient_id == "C75768"
+    assert records[0].visit_id == "5665d_B_brain_21h15m"
+    assert tuple(Path(path).name if path else None for path in records[0].modalities) == (
+        "t1_mprage_tra_p2_iso_1.0.nii.gz",
+        "t2_spc_tra_p2_iso_1.0.nii.gz",
+        "t1_mprage_tra_p2_iso_1.0_POST.nii.gz",
+        "t2_tirm_tra_dark_p2_brain.nii.gz",
+    )
+
+
 def test_discover_cases_with_content_classifier_for_anonymous_files(tmp_path) -> None:
     visit = tmp_path / "patient_001" / "visit_01"
     visit.mkdir(parents=True)
@@ -93,6 +120,26 @@ def test_discover_cases_with_content_classifier_for_anonymous_files(tmp_path) ->
         "anon_c.nii.gz",
         "anon_d.nii.gz",
     )
+
+
+def test_predict_visit_mask_writes_label_volume(tmp_path) -> None:
+    sitk = pytest.importorskip("SimpleITK")
+    image = sitk.GetImageFromArray(torch.ones(4, 5, 6).numpy())
+    path = tmp_path / "t1.nii.gz"
+    sitk.WriteImage(image, str(path))
+    record = VisitRecord("patient", "visit", 0.0, (str(path), None, None, None), None)
+
+    class TinyModel(torch.nn.Module):
+        def forward(self, x, **kwargs):
+            probabilities = torch.zeros((1, 1, 4, *x.shape[-3:]), dtype=x.dtype, device=x.device)
+            probabilities[:, :, 1] = 0.9
+            return type("Output", (), {"probabilities": probabilities})()
+
+    output = predict_visit_mask(TinyModel(), record, tmp_path / "mask.nii.gz", torch.device("cpu"))
+    mask = sitk.GetArrayFromImage(sitk.ReadImage(str(output)))
+    assert output.exists()
+    assert mask.shape == (4, 5, 6)
+    assert set(mask.ravel()) == {2}
 
 
 def test_longitumor_forward_backward() -> None:
