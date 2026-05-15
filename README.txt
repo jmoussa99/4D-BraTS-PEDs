@@ -65,10 +65,14 @@ Repository Layout
     scripts/
       create_manifest.py          Discover visits and write a manifest
       generate_masks.py           Generate masks from a manifest
+      evaluate_longitudinal.py    Export observed-visit overlays, metrics, volumes
       train_single_timepoint.py   Single-timepoint segmentation training
       train_longitudinal.py       Longitudinal model training
+      train_future_segmentation.py
+      predict_future_segmentation.py
       train_sequence_classifier.py
       classify_sequences.py
+      create_review_sheet.py
       smoke_test.py
 
     tests/
@@ -131,6 +135,14 @@ For the trial dataset:
 
     .\.venv\Scripts\python.exe scripts\create_manifest.py --data-dir trial --output trial_manifest.csv
 
+For the recommended brain-only clinical demo cohort:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\create_manifest.py ^
+      --data-dir trial ^
+      --output trial_manifest_brain.csv ^
+      --include-visit-token brain ^
+      --exclude-visit-token spine
+
 The discovery code handles:
 
 * nested `{patient}/{visit}/{series}` folders,
@@ -139,6 +151,27 @@ The discovery code handles:
 * missing modalities,
 * modality selection from clinical series names,
 * preference for larger/full series over tiny one-slice files.
+
+Spine imaging should stay out of the default brain tumor pipeline. It is useful
+for metastasis review, but spinal tumor detection/segmentation is a separate
+problem.
+
+
+Sequence Selection QC
+---------------------
+
+Run the MRI sequence classifier on the available patients before relying on
+automatic T1/T1c/T2/FLAIR selection:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\classify_sequences.py ^
+      --checkpoint sequence_classifier_checkpoint.pt ^
+      --input trial\trial ^
+      --output runs\sequence_qc.csv ^
+      --device cuda
+
+Compare the selected sequence paths against any manually selected
+diagnosis-time reference sequences. Low-confidence or wrong sequence choices
+should be flagged for visual review.
 
 
 Generate Pediatric Masks
@@ -182,6 +215,103 @@ Example:
 
 Exact training arguments may vary by experiment; run any script with `--help`
 to see its options.
+
+
+Observed And Future Longitudinal Outputs
+----------------------------------------
+
+There are two separate modeling tracks:
+
+1. Observed longitudinal segmentation:
+
+       input visits 0..N -> masks for visits 0..N
+
+   This uses temporal context to segment observed scans.
+
+2. Future segmentation forecasting:
+
+       input visits 0..N-1 -> mask for visit N
+
+   This is the next-visit tumor mask prediction task.
+
+Train the observed longitudinal model on GPU:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\train_longitudinal.py ^
+      --manifest trial_manifest_with_pediatric_masks.csv ^
+      --epochs 20 ^
+      --batch-size 1 ^
+      --output-dir runs\longitumor_longitudinal_gpu ^
+      --device cuda
+
+Export observed-visit overlays, metrics, and volume plots:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\evaluate_longitudinal.py ^
+      --manifest trial_manifest_with_pediatric_masks.csv ^
+      --checkpoint runs\longitumor_longitudinal_gpu\last.pt ^
+      --output-dir runs\longitumor_longitudinal_gpu_eval ^
+      --device cuda
+
+Train the future segmentation model:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\train_future_segmentation.py ^
+      --manifest trial_manifest_with_pediatric_masks.csv ^
+      --epochs 20 ^
+      --batch-size 1 ^
+      --input-timepoints 3 ^
+      --output-dir runs\longitumor_future ^
+      --device cuda
+
+Evaluate known next-visit forecasting windows:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\predict_future_segmentation.py ^
+      --manifest trial_manifest_with_pediatric_masks.csv ^
+      --checkpoint runs\longitumor_future\last.pt ^
+      --output-dir runs\longitumor_future_predictions ^
+      --input-timepoints 3 ^
+      --device cuda
+
+Forecast after each patient's latest visit:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\predict_future_segmentation.py ^
+      --manifest trial_manifest_with_pediatric_masks.csv ^
+      --checkpoint runs\longitumor_future\last.pt ^
+      --output-dir runs\longitumor_future_latest ^
+      --input-timepoints 3 ^
+      --device cuda ^
+      --latest
+
+Use `--patch-size full` with `predict_future_segmentation.py` to write
+full-volume NIfTI forecast masks in addition to PNG overlays.
+
+
+Visual Review
+-------------
+
+For broad clinical review, use exported overlays and a Likert/acceptability
+sheet. Dice scores should be reserved for the manually annotated subset or a
+small curated sample.
+
+Create a review CSV from exported PNG overlays:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\create_review_sheet.py ^
+      --overlay-dir runs\longitumor_longitudinal_gpu_eval\overlays ^
+      --output runs\longitumor_longitudinal_gpu_eval\visual_review.csv
+
+Suggested fields are included in the CSV: acceptability, Likert score, failure
+reason, reviewer, and notes.
+
+
+Clinical Pipeline Notes
+-----------------------
+
+See `docs/clinical_pipeline_recommendations.md` for the current recommended
+demo plan. Key points:
+
+* manual reference-standard masks are true labels,
+* pediatric nnU-Net masks are pseudo-labels unless manually reviewed,
+* brain-only visits should be the default cohort,
+* orientation and sequence-selection QC must be visually checked,
+* volume-over-time trends are a primary review output.
 
 
 Version Control Notes

@@ -460,6 +460,66 @@ def load_volume(path: str | Path) -> tuple[np.ndarray, tuple[float, float, float
     return array, spacing
 
 
+def _resample_to_reference(
+    image: "sitk.Image",
+    reference: "sitk.Image",
+    interpolator: int,
+    default_value: float = 0.0,
+) -> "sitk.Image":
+    _require_sitk()
+    if (
+        image.GetSize() == reference.GetSize()
+        and image.GetSpacing() == reference.GetSpacing()
+        and image.GetOrigin() == reference.GetOrigin()
+        and image.GetDirection() == reference.GetDirection()
+    ):
+        return image
+    return sitk.Resample(
+        image,
+        reference,
+        sitk.Transform(),
+        interpolator,
+        default_value,
+        image.GetPixelID(),
+    )
+
+
+def _load_visit_arrays(
+    record: VisitRecord,
+    reference: "sitk.Image | None" = None,
+) -> tuple[np.ndarray, np.ndarray, list[float], tuple[float, float, float]]:
+    _require_sitk()
+    if reference is None:
+        reference_path = record.mask_path or next((path for path in record.modalities if path), None)
+        if reference_path is None:
+            raise ValueError(f"Cannot infer visit shape for {record.patient_id}/{record.visit_id}")
+        reference = sitk.ReadImage(str(reference_path))
+    reference_shape = tuple(reversed(reference.GetSize()))
+    volumes: list[np.ndarray] = []
+    availability: list[float] = []
+    for path in record.modalities:
+        if path:
+            image = sitk.ReadImage(str(path))
+            image = _resample_to_reference(image, reference, sitk.sitkLinear)
+            volumes.append(zscore_nonzero(sitk.GetArrayFromImage(image).astype(np.float32)))
+            availability.append(1.0)
+        else:
+            volumes.append(np.zeros(reference_shape, dtype=np.float32))
+            availability.append(0.0)
+    image = np.stack(volumes, axis=0)
+
+    if record.mask_path:
+        label_image = sitk.ReadImage(str(record.mask_path))
+        label_image = _resample_to_reference(label_image, reference, sitk.sitkNearestNeighbor)
+        label = sitk.GetArrayFromImage(label_image).astype(np.int16)
+        target = labels_to_channels(label)
+    else:
+        target = np.zeros((4, *reference_shape), dtype=np.float32)
+
+    spacing = tuple(float(v) for v in reference.GetSpacing())
+    return image, target, availability, spacing
+
+
 def zscore_nonzero(volume: np.ndarray) -> np.ndarray:
     out = volume.astype(np.float32, copy=True)
     mask = out != 0
@@ -501,6 +561,19 @@ def random_patch_slices(
     return tuple(slice(start, min(start + patch, dim)) for start, patch, dim in zip(starts, patch_size_zyx, shape_zyx))  # type: ignore[return-value]
 
 
+def _pad_spatial_to_shape(array: np.ndarray, target_shape: Sequence[int]) -> np.ndarray:
+    spatial_shape = array.shape[-3:]
+    pad_width = [(0, 0)] * (array.ndim - 3)
+    for dim, target in zip(spatial_shape, target_shape):
+        missing = max(0, target - dim)
+        before = missing // 2
+        after = missing - before
+        pad_width.append((before, after))
+    if all(before == 0 and after == 0 for before, after in pad_width):
+        return array
+    return np.pad(array, pad_width, mode="constant")
+
+
 class SingleVisitMRIDataset(Dataset):
     def __init__(
         self,
@@ -519,36 +592,15 @@ class SingleVisitMRIDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         record = self.records[index]
-        volumes: list[np.ndarray] = []
-        availability: list[float] = []
-        reference_shape: tuple[int, int, int] | None = None
-        spacing = (1.0, 1.0, 1.0)
-        for path in record.modalities:
-            if path:
-                volume, spacing = load_volume(path)
-                volume = zscore_nonzero(volume)
-                reference_shape = volume.shape
-                volumes.append(volume)
-                availability.append(1.0)
-            else:
-                if reference_shape is None:
-                    raise ValueError(f"Cannot infer missing modality shape for {record.patient_id}")
-                volumes.append(np.zeros(reference_shape, dtype=np.float32))
-                availability.append(0.0)
-        image = np.stack(volumes, axis=0)
-
-        if record.mask_path:
-            label, _ = load_volume(record.mask_path)
-            target = labels_to_channels(label.astype(np.int16))
-            foreground = target.any(axis=0)
-        else:
-            target = np.zeros((4, *image.shape[1:]), dtype=np.float32)
-            foreground = None
+        image, target, availability, spacing = _load_visit_arrays(record)
+        foreground = target.any(axis=0) if record.mask_path else None
 
         if self.patch_size is not None:
             zsl, ysl, xsl = random_patch_slices(image.shape[1:], self.patch_size, foreground)
             image = image[:, zsl, ysl, xsl]
             target = target[:, zsl, ysl, xsl]
+            image = _pad_spatial_to_shape(image, self.patch_size)
+            target = _pad_spatial_to_shape(target, self.patch_size)
 
         return {
             "image": torch.from_numpy(image),
@@ -588,7 +640,70 @@ class LongitudinalMRIDataset(Dataset):
             "target": torch.stack([s["target"] for s in samples], dim=0),
             "availability": torch.stack([s["availability"] for s in samples], dim=0),
             "delta_t": torch.tensor([visit.delta_t for visit in visits], dtype=torch.float32),
+            "spacing": torch.stack([s["spacing"] for s in samples], dim=0),
             "patient_id": visits[0].patient_id,
+        }
+
+
+class FutureSegmentationDataset(Dataset):
+    """Sliding-window dataset for next-visit tumor segmentation forecasting."""
+
+    def __init__(
+        self,
+        records: Sequence[VisitRecord],
+        input_timepoints: int = 3,
+        patch_size: tuple[int, int, int] | None = (96, 160, 160),
+    ) -> None:
+        if torch is None:
+            raise ImportError("torch is required for FutureSegmentationDataset")
+        self.input_timepoints = input_timepoints
+        self.patch_size = patch_size
+        grouped: dict[str, list[VisitRecord]] = {}
+        for record in records:
+            if record.mask_path:
+                grouped.setdefault(record.patient_id, []).append(record)
+        self.windows: list[tuple[list[VisitRecord], VisitRecord]] = []
+        for visits in grouped.values():
+            ordered = sorted(visits, key=lambda r: (r.delta_t, r.visit_id))
+            for start in range(0, len(ordered) - input_timepoints):
+                self.windows.append((ordered[start : start + input_timepoints], ordered[start + input_timepoints]))
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        input_visits, future_visit = self.windows[index]
+        if not future_visit.mask_path:
+            raise ValueError(f"Future visit has no mask: {future_visit.patient_id}/{future_visit.visit_id}")
+        _require_sitk()
+        reference = sitk.ReadImage(str(future_visit.mask_path))
+        images: list[np.ndarray] = []
+        availability: list[torch.Tensor] = []
+        for visit in input_visits:
+            image, _, available, _ = _load_visit_arrays(visit, reference=reference)
+            images.append(image)
+            availability.append(torch.tensor(available, dtype=torch.float32))
+        _, target, _, spacing = _load_visit_arrays(future_visit, reference=reference)
+        image_sequence = np.stack(images, axis=0)
+        foreground = target.any(axis=0)
+
+        if self.patch_size is not None:
+            zsl, ysl, xsl = random_patch_slices(target.shape[1:], self.patch_size, foreground)
+            image_sequence = image_sequence[:, :, zsl, ysl, xsl]
+            target = target[:, zsl, ysl, xsl]
+            image_sequence = _pad_spatial_to_shape(image_sequence, self.patch_size)
+            target = _pad_spatial_to_shape(target, self.patch_size)
+
+        return {
+            "image": torch.from_numpy(image_sequence),
+            "target": torch.from_numpy(target),
+            "availability": torch.stack(availability, dim=0),
+            "delta_t": torch.tensor([visit.delta_t for visit in input_visits], dtype=torch.float32),
+            "future_delta_t": torch.tensor(future_visit.delta_t, dtype=torch.float32),
+            "patient_id": future_visit.patient_id,
+            "input_visit_ids": "|".join(visit.visit_id for visit in input_visits),
+            "future_visit_id": future_visit.visit_id,
+            "spacing": torch.tensor(spacing, dtype=torch.float32),
         }
 
 

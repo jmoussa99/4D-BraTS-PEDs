@@ -65,6 +65,18 @@ def main() -> None:
     parser.add_argument("--pediatric-folds", default="0,1,2,3,4")
     parser.add_argument("--pediatric-python", default=sys.executable)
     parser.add_argument("--pediatric-command", default="nnUNetv2_predict")
+    parser.add_argument(
+        "--include-visit-token",
+        action="append",
+        default=[],
+        help="Keep only visits whose visit_id contains this token. Can be repeated, for example --include-visit-token brain.",
+    )
+    parser.add_argument(
+        "--exclude-visit-token",
+        action="append",
+        default=[],
+        help="Drop visits whose visit_id contains this token. Can be repeated, for example --exclude-visit-token spine.",
+    )
     args = parser.parse_args()
     if args.generate_masks_checkpoint is not None and args.pediatric_model_repo is not None:
         parser.error("Use only one mask generator: --generate-masks-checkpoint or --pediatric-model-repo.")
@@ -80,6 +92,20 @@ def main() -> None:
             return prediction.modality or "", prediction.confidence
 
     records = discover_cases(args.data_dir, modality_classifier=classifier, classifier_threshold=args.classifier_threshold)
+    include_tokens = [token.lower() for token in args.include_visit_token]
+    exclude_tokens = [token.lower() for token in args.exclude_visit_token]
+    if include_tokens:
+        records = [
+            record
+            for record in records
+            if any(token in record.visit_id.lower() for token in include_tokens)
+        ]
+    if exclude_tokens:
+        records = [
+            record
+            for record in records
+            if not any(token in record.visit_id.lower() for token in exclude_tokens)
+        ]
     if args.generate_masks_checkpoint is not None:
         from longitumor.inference import load_segmentation_model, predict_visit_mask
 

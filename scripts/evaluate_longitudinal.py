@@ -1,0 +1,238 @@
+#!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from longitumor.data import LongitudinalMRIDataset, read_manifest
+from longitumor.evaluation import dice_score, sensitivity_precision, volume_similarity
+from longitumor.inference import load_segmentation_model
+from longitumor.utils import parse_patch_size
+
+
+CLASS_NAMES = ("label_1", "label_2", "label_3", "label_4")
+
+
+def _normalize_image(image: np.ndarray) -> np.ndarray:
+    lo, hi = np.percentile(image, (1, 99))
+    if hi <= lo:
+        return np.zeros_like(image, dtype=np.float32)
+    return np.clip((image - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+def _best_slice(target: np.ndarray, pred: np.ndarray) -> int:
+    target_area = target.sum(axis=(1, 2))
+    if target_area.max() > 0:
+        return int(target_area.argmax())
+    pred_area = pred.sum(axis=(1, 2))
+    if pred_area.max() > 0:
+        return int(pred_area.argmax())
+    return int(target.shape[0] // 2)
+
+
+def _write_overlay(
+    image: np.ndarray,
+    target: np.ndarray,
+    pred: np.ndarray,
+    output_path: Path,
+    title: str,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    z = _best_slice(target, pred)
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.imshow(_normalize_image(image[z]), cmap="gray")
+    if target[z].any():
+        ax.contour(target[z], levels=[0.5], colors=["lime"], linewidths=1.2)
+    if pred[z].any():
+        ax.contour(pred[z], levels=[0.5], colors=["red"], linewidths=1.2)
+    ax.set_title(f"{title} z={z}  target=green pred=red", fontsize=10)
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def _write_metric_plot(rows: list[dict[str, str]], output_path: Path) -> None:
+    if not rows:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    labels = [f"{row['patient_id']} t{row['time_index']}" for row in rows if row["class"] == "mean"]
+    dice = [float(row["dice"]) for row in rows if row["class"] == "mean"]
+    sensitivity = [float(row["sensitivity"]) for row in rows if row["class"] == "mean"]
+    precision = [float(row["precision"]) for row in rows if row["class"] == "mean"]
+
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(max(9, len(labels) * 0.55), 5))
+    ax.plot(x, dice, marker="o", label="Dice")
+    ax.plot(x, sensitivity, marker="o", label="Sensitivity")
+    ax.plot(x, precision, marker="o", label="Precision")
+    ax.set_ylim(0.0, 1.05)
+    ax.set_ylabel("score")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def _write_volume_plot(rows: list[dict[str, str]], output_path: Path) -> None:
+    mean_rows = [row for row in rows if row["class"] == "mean"]
+    if not mean_rows:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    labels = [f"{row['patient_id']} t{row['time_index']}" for row in mean_rows]
+    pred = [float(row["pred_volume_ml"]) for row in mean_rows]
+    target = [float(row["target_volume_ml"]) for row in mean_rows]
+
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(max(9, len(labels) * 0.55), 5))
+    ax.plot(x, pred, marker="o", label="Predicted")
+    ax.plot(x, target, marker="o", label="Reference")
+    ax.set_ylabel("volume (mL)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Save longitudinal prediction overlays and metric plots.")
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=Path("runs/longitumor_eval"))
+    parser.add_argument("--patch-size", default="96,160,160")
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--limit", type=int, default=None, help="Optional number of patient sequences to evaluate.")
+    args = parser.parse_args()
+
+    model, device = load_segmentation_model(args.checkpoint, args.device)
+    records = read_manifest(args.manifest)
+    dataset = LongitudinalMRIDataset(records, patch_size=parse_patch_size(args.patch_size))
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    rows: list[dict[str, str]] = []
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    with torch.no_grad():
+        for sequence_index, batch in enumerate(tqdm(loader, desc="evaluating")):
+            if args.limit is not None and sequence_index >= args.limit:
+                break
+            patient_id = str(batch["patient_id"][0])
+            x = batch["image"].to(device)
+            target = batch["target"].to(device)
+            availability = batch["availability"].to(device)
+            delta_t = batch["delta_t"].to(device)
+            output = model(x, availability=availability, delta_t=delta_t)
+            probabilities = output.probabilities.detach().cpu()
+            target_cpu = target.detach().cpu()
+            image_cpu = batch["image"].detach().cpu()
+            pred_cpu = (probabilities >= args.threshold).float()
+            spacing_cpu = batch["spacing"].detach().cpu()
+
+            dice = dice_score(probabilities.reshape(-1, *probabilities.shape[2:]), target_cpu.reshape(-1, *target_cpu.shape[2:]), args.threshold)
+            sensitivity, precision = sensitivity_precision(
+                probabilities.reshape(-1, *probabilities.shape[2:]),
+                target_cpu.reshape(-1, *target_cpu.shape[2:]),
+                args.threshold,
+            )
+            vol_sim = volume_similarity(
+                probabilities.reshape(-1, *probabilities.shape[2:]),
+                target_cpu.reshape(-1, *target_cpu.shape[2:]),
+                args.threshold,
+            )
+
+            timepoints = probabilities.shape[1]
+            for time_index in range(timepoints):
+                flat_index = time_index
+                values = {
+                    "dice": dice[flat_index],
+                    "sensitivity": sensitivity[flat_index],
+                    "precision": precision[flat_index],
+                    "volume_similarity": vol_sim[flat_index],
+                }
+                voxel_volume_ml = float(spacing_cpu[0, time_index].prod().item()) / 1000.0
+                pred_volumes = pred_cpu[0, time_index].flatten(1).sum(dim=1) * voxel_volume_ml
+                target_volumes = target_cpu[0, time_index].flatten(1).sum(dim=1) * voxel_volume_ml
+                for class_index, class_name in enumerate(CLASS_NAMES):
+                    rows.append(
+                        {
+                            "patient_id": patient_id,
+                            "sequence_index": str(sequence_index),
+                            "time_index": str(time_index),
+                            "class": class_name,
+                            **{name: f"{tensor[class_index].item():.6f}" for name, tensor in values.items()},
+                            "pred_volume_ml": f"{pred_volumes[class_index].item():.6f}",
+                            "target_volume_ml": f"{target_volumes[class_index].item():.6f}",
+                        }
+                    )
+                rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "sequence_index": str(sequence_index),
+                        "time_index": str(time_index),
+                        "class": "mean",
+                        **{name: f"{tensor.mean().item():.6f}" for name, tensor in values.items()},
+                        "pred_volume_ml": f"{pred_volumes.sum().item():.6f}",
+                        "target_volume_ml": f"{target_volumes.sum().item():.6f}",
+                    }
+                )
+
+                available = batch["availability"][0, time_index].bool()
+                modality_index = int(torch.where(available)[0][0]) if available.any() else 0
+                image = image_cpu[0, time_index, modality_index].numpy()
+                target_union = target_cpu[0, time_index].amax(dim=0).numpy()
+                pred_union = pred_cpu[0, time_index].amax(dim=0).numpy()
+                _write_overlay(
+                    image=image,
+                    target=target_union,
+                    pred=pred_union,
+                    output_path=args.output_dir / "overlays" / patient_id / f"time_{time_index:02d}.png",
+                    title=f"{patient_id} time {time_index}",
+                )
+
+    metrics_path = args.output_dir / "metrics.csv"
+    with metrics_path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "patient_id",
+                "sequence_index",
+                "time_index",
+                "class",
+                "dice",
+                "sensitivity",
+                "precision",
+                "volume_similarity",
+                "pred_volume_ml",
+                "target_volume_ml",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    _write_metric_plot(rows, args.output_dir / "metric_trends.png")
+    _write_volume_plot(rows, args.output_dir / "volume_trends.png")
+    print(f"Wrote metrics to {metrics_path}")
+    print(f"Wrote overlays under {args.output_dir / 'overlays'}")
+    print(f"Wrote metric plot to {args.output_dir / 'metric_trends.png'}")
+    print(f"Wrote volume plot to {args.output_dir / 'volume_trends.png'}")
+
+
+if __name__ == "__main__":
+    main()
