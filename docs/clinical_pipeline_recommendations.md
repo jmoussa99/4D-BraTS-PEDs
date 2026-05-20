@@ -1,148 +1,119 @@
 Clinical Pipeline Recommendations
 =================================
 
-This plan reflects the current project goal: demonstrate an end-to-end,
-clinically inspectable pediatric brain tumor MRI pipeline before expanding to a
-larger server-side cohort.
+Current Scope
+-------------
+
+The first critical deliverable is automatic MRI sequence classification. The
+longitudinal segmentation pipeline depends on correctly identifying and
+harmonizing T1, T1 contrast-enhanced, T2, and FLAIR sequences across visits.
+
+The initial longitudinal evaluation should use approximately 40 pediatric brain
+tumor patients with serial brain MRI. Each patient may have close to 10 exams,
+but the first deliverable should focus on:
+
+* baseline/diagnosis imaging,
+* one mid-treatment follow-up,
+* one end-of-treatment follow-up.
+
+At minimum, the pipeline should generate tumor masks for at least two
+longitudinal timepoints per patient. Full-trajectory forecasting is out of scope
+for the current milestone.
 
 
-Primary Goal
-------------
+Ground Truth And Labels
+-----------------------
 
-Build a working brain-only pipeline that can:
+Use manual reference-standard diagnosis-time annotations as true ground truth.
+Use pediatric nnU-Net generated masks as pseudo-labels only when manual masks
+are unavailable. Reports, slides, and metrics should clearly separate:
 
-1. select T1, T1c, T2, and FLAIR sequences from raw clinical folders,
-2. normalize/resample each visit into a consistent 3D grid,
-3. generate longitudinal tumor masks,
-4. estimate tumor volume over time,
-5. export visual review images for radiologist Likert scoring, and
-6. optionally forecast the next-visit segmentation from prior timepoints.
+* manual reference-standard masks,
+* pseudo-label masks,
+* model-generated masks for review.
 
-For the June checkpoint, the most important deliverable is an integrated
-pipeline with inspectable outputs, not a fully validated Dice benchmark over all
-timepoints.
+This avoids presenting a downstream result trained or evaluated on automatic
+masks as if it were fully manually validated.
 
 
-Ground Truth Strategy
----------------------
+Recommended Pipeline
+--------------------
 
-Separate mask sources clearly:
-
-* Manual reference-standard masks: use these as true supervised labels and as
-  the main quality anchor. Diagnosis-time annotated imaging should be treated
-  as ground truth where available.
-* Pediatric nnU-Net masks: use these as pseudo-labels for bootstrapping,
-  pipeline integration, visual review, and weak supervision. Do not present
-  downstream evolution metrics from pseudo-labels as if they were fully
-  validated ground-truth results.
-* Visual Likert review: use radiologist acceptability scoring for broader
-  review where full reference standards are not available.
-
-Avoid a hidden "prediction from prediction" claim. If a future model is trained
-on pseudo-label masks, report it as pseudo-label-supervised forecasting until a
-manual subset is reviewed.
+1. Create a brain-only manifest and omit spine visits.
+2. Run sequence classification for all candidate MRI volumes.
+3. Review sequence-classification confidence and selected paths.
+4. Build a baseline/mid/end manifest per patient.
+5. Generate or attach segmentation masks for selected timepoints.
+6. Train/run longitudinal segmentation for observed timepoints.
+7. Export volumetric agreement, temporal consistency, overlays, and volume plots.
+8. Create a radiology review sheet with Likert/acceptability fields.
 
 
-Recommended Default Cohort
---------------------------
+Sequence Classification
+-----------------------
 
-Use brain visits only. Spine imaging is a separate metastasis task and should
-not be mixed into the brain tumor segmentation pipeline.
+Sequence classification is a first-class component, not an implementation
+detail. For each selected scan, record:
 
-Create the brain-only manifest:
-
-    .\.venv-nnunet\Scripts\python.exe scripts\create_manifest.py ^
-      --data-dir trial ^
-      --output trial_manifest_brain.csv ^
-      --include-visit-token brain ^
-      --exclude-visit-token spine
-
-Use three to five timepoints per patient for the first longitudinal demo. The
-folder day prefix, such as `1921d`, is chronological time in days; it is not an
-actual calendar date.
-
-
-Sequence Selection
-------------------
-
-Run the sequence classifier at least on the three available patients and compare
-its selected T1/T1c/T2/FLAIR volumes against the diagnosis-time manually selected
-series where those are known. Record:
-
+* source path,
 * predicted modality,
 * confidence,
-* selected file path,
-* whether visual/manual review accepts the selection.
+* vote distribution,
+* status/error,
+* whether visual/manual review accepts it.
 
-Clinical folders include vendor-specific protocols and localizers/scouts, so
-sequence selection should be a first-class QC step, not an invisible detail.
-
-
-Orientation And Resampling QC
------------------------------
-
-The pipeline should resample modalities to a common visit grid before stacking
-channels. This is already implemented in `longitumor.data` for training. Keep
-orientation QC visible because anonymization may remove or alter metadata. For
-review exports, inspect overlays for:
-
-* left-right or upside-down orientation problems,
-* modality mismatch,
-* masks shifted relative to tumor,
-* inconsistent volume jumps caused by registration/sequence errors.
+Low-confidence sequence choices should be reviewed before segmentation.
 
 
-Training Tracks
----------------
+Preprocessing And Harmonization
+-------------------------------
 
-Use two separate tracks:
+Before stacking modalities, every visit should be resampled to a common grid.
+The loader already resamples modalities to the visit mask/reference grid. Review
+outputs should be inspected for:
 
-* Observed longitudinal segmentation:
-  `input visits 0..N -> masks for visits 0..N`.
-  This tests whether temporal context improves segmentation consistency over
-  observed scans.
-
-* Future segmentation forecasting:
-  `input visits 0..N-1 -> mask for visit N`.
-  This is the actual next-visit prediction task. Treat results as experimental,
-  especially if trained from pseudo-label masks.
-
-Do not merge these claims in presentation slides.
+* wrong sequence selection,
+* left-right or superior-inferior orientation problems,
+* shifted masks,
+* large volume jumps caused by preprocessing,
+* failed scans or poor image quality.
 
 
-Review Outputs
---------------
+Evaluation
+----------
 
-For broad review, export PNG overlays and a CSV review sheet. Dice is useful for
-the small manually annotated subset, but the larger trial review should use a
-Likert/acceptability scale:
+Quantitative evaluation should prioritize:
 
-* acceptable,
-* borderline,
-* unacceptable,
-* failure reason.
+* volumetric agreement,
+* predicted volume over time,
+* target/reference volume over time when available,
+* temporal consistency of volume and mask behavior.
 
-Recommended failure reasons:
+Dice can be reported for the manually annotated subset, but broad review should
+use radiologist visual evaluation with a Likert or acceptable/unacceptable
+scale.
 
-* wrong sequence,
-* wrong orientation,
-* missed tumor,
-* oversegmentation,
-* shifted mask,
-* poor image quality,
-* uncertain anatomy.
+Suggested review fields:
+
+* acceptable / borderline / unacceptable,
+* Likert score 1-5,
+* failure reason,
+* reviewer,
+* notes.
 
 
-Minimum Demo Checklist
-----------------------
+Deliverables
+------------
 
-Before the next update, produce:
+The current milestone should produce:
 
-1. brain-only manifest,
-2. sequence classifier CSV for the three patients,
-3. pediatric nnU-Net pseudo-masks or manual masks attached to manifest,
-4. observed longitudinal segmentation checkpoint,
-5. future segmentation checkpoint,
-6. overlay PNGs for observed and future predictions,
-7. volume-over-time CSV/plot,
-8. visual review CSV for radiologist scoring.
+* sequence-classification CSV,
+* brain-only baseline/mid/end manifest,
+* longitudinal segmentation masks for selected timepoints,
+* overlay PNGs for radiologist review,
+* volumetric CSVs and plots,
+* temporal consistency metrics,
+* Likert review spreadsheet,
+* architecture diagram,
+* preprocessing workflow,
+* reproducible inference commands.

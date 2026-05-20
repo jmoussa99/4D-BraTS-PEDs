@@ -645,68 +645,6 @@ class LongitudinalMRIDataset(Dataset):
         }
 
 
-class FutureSegmentationDataset(Dataset):
-    """Sliding-window dataset for next-visit tumor segmentation forecasting."""
-
-    def __init__(
-        self,
-        records: Sequence[VisitRecord],
-        input_timepoints: int = 3,
-        patch_size: tuple[int, int, int] | None = (96, 160, 160),
-    ) -> None:
-        if torch is None:
-            raise ImportError("torch is required for FutureSegmentationDataset")
-        self.input_timepoints = input_timepoints
-        self.patch_size = patch_size
-        grouped: dict[str, list[VisitRecord]] = {}
-        for record in records:
-            if record.mask_path:
-                grouped.setdefault(record.patient_id, []).append(record)
-        self.windows: list[tuple[list[VisitRecord], VisitRecord]] = []
-        for visits in grouped.values():
-            ordered = sorted(visits, key=lambda r: (r.delta_t, r.visit_id))
-            for start in range(0, len(ordered) - input_timepoints):
-                self.windows.append((ordered[start : start + input_timepoints], ordered[start + input_timepoints]))
-
-    def __len__(self) -> int:
-        return len(self.windows)
-
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
-        input_visits, future_visit = self.windows[index]
-        if not future_visit.mask_path:
-            raise ValueError(f"Future visit has no mask: {future_visit.patient_id}/{future_visit.visit_id}")
-        _require_sitk()
-        reference = sitk.ReadImage(str(future_visit.mask_path))
-        images: list[np.ndarray] = []
-        availability: list[torch.Tensor] = []
-        for visit in input_visits:
-            image, _, available, _ = _load_visit_arrays(visit, reference=reference)
-            images.append(image)
-            availability.append(torch.tensor(available, dtype=torch.float32))
-        _, target, _, spacing = _load_visit_arrays(future_visit, reference=reference)
-        image_sequence = np.stack(images, axis=0)
-        foreground = target.any(axis=0)
-
-        if self.patch_size is not None:
-            zsl, ysl, xsl = random_patch_slices(target.shape[1:], self.patch_size, foreground)
-            image_sequence = image_sequence[:, :, zsl, ysl, xsl]
-            target = target[:, zsl, ysl, xsl]
-            image_sequence = _pad_spatial_to_shape(image_sequence, self.patch_size)
-            target = _pad_spatial_to_shape(target, self.patch_size)
-
-        return {
-            "image": torch.from_numpy(image_sequence),
-            "target": torch.from_numpy(target),
-            "availability": torch.stack(availability, dim=0),
-            "delta_t": torch.tensor([visit.delta_t for visit in input_visits], dtype=torch.float32),
-            "future_delta_t": torch.tensor(future_visit.delta_t, dtype=torch.float32),
-            "patient_id": future_visit.patient_id,
-            "input_visit_ids": "|".join(visit.visit_id for visit in input_visits),
-            "future_visit_id": future_visit.visit_id,
-            "spacing": torch.tensor(spacing, dtype=torch.float32),
-        }
-
-
 def collate_single_visit(batch: Iterable[dict[str, torch.Tensor | str]]) -> dict[str, torch.Tensor | list[str]]:
     items = list(batch)
     return {

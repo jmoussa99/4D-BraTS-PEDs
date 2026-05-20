@@ -112,6 +112,56 @@ def _write_volume_plot(rows: list[dict[str, str]], output_path: Path) -> None:
     plt.close(fig)
 
 
+def _write_temporal_consistency(rows: list[dict[str, str]], output_path: Path) -> None:
+    mean_rows = [row for row in rows if row["class"] == "mean"]
+    grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for row in mean_rows:
+        grouped.setdefault((row["patient_id"], row["sequence_index"]), []).append(row)
+
+    temporal_rows: list[dict[str, str]] = []
+    for (patient_id, sequence_index), patient_rows in grouped.items():
+        ordered = sorted(patient_rows, key=lambda r: int(r["time_index"]))
+        for previous, current in zip(ordered, ordered[1:]):
+            prev_pred = float(previous["pred_volume_ml"])
+            curr_pred = float(current["pred_volume_ml"])
+            prev_target = float(previous["target_volume_ml"])
+            curr_target = float(current["target_volume_ml"])
+            temporal_rows.append(
+                {
+                    "patient_id": patient_id,
+                    "sequence_index": sequence_index,
+                    "from_time_index": previous["time_index"],
+                    "to_time_index": current["time_index"],
+                    "from_delta_t": previous["delta_t"],
+                    "to_delta_t": current["delta_t"],
+                    "pred_volume_change_ml": f"{curr_pred - prev_pred:.6f}",
+                    "pred_relative_change": f"{(curr_pred - prev_pred) / max(prev_pred, 1e-6):.6f}",
+                    "target_volume_change_ml": f"{curr_target - prev_target:.6f}",
+                    "target_relative_change": f"{(curr_target - prev_target) / max(prev_target, 1e-6):.6f}",
+                }
+            )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "patient_id",
+                "sequence_index",
+                "from_time_index",
+                "to_time_index",
+                "from_delta_t",
+                "to_delta_t",
+                "pred_volume_change_ml",
+                "pred_relative_change",
+                "target_volume_change_ml",
+                "target_relative_change",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(temporal_rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Save longitudinal prediction overlays and metric plots.")
     parser.add_argument("--manifest", type=Path, required=True)
@@ -145,6 +195,7 @@ def main() -> None:
             image_cpu = batch["image"].detach().cpu()
             pred_cpu = (probabilities >= args.threshold).float()
             spacing_cpu = batch["spacing"].detach().cpu()
+            delta_t_cpu = batch["delta_t"].detach().cpu()
 
             dice = dice_score(probabilities.reshape(-1, *probabilities.shape[2:]), target_cpu.reshape(-1, *target_cpu.shape[2:]), args.threshold)
             sensitivity, precision = sensitivity_precision(
@@ -176,6 +227,7 @@ def main() -> None:
                             "patient_id": patient_id,
                             "sequence_index": str(sequence_index),
                             "time_index": str(time_index),
+                            "delta_t": f"{delta_t_cpu[0, time_index].item():.6f}",
                             "class": class_name,
                             **{name: f"{tensor[class_index].item():.6f}" for name, tensor in values.items()},
                             "pred_volume_ml": f"{pred_volumes[class_index].item():.6f}",
@@ -187,6 +239,7 @@ def main() -> None:
                         "patient_id": patient_id,
                         "sequence_index": str(sequence_index),
                         "time_index": str(time_index),
+                        "delta_t": f"{delta_t_cpu[0, time_index].item():.6f}",
                         "class": "mean",
                         **{name: f"{tensor.mean().item():.6f}" for name, tensor in values.items()},
                         "pred_volume_ml": f"{pred_volumes.sum().item():.6f}",
@@ -215,6 +268,7 @@ def main() -> None:
                 "patient_id",
                 "sequence_index",
                 "time_index",
+                "delta_t",
                 "class",
                 "dice",
                 "sensitivity",
@@ -228,10 +282,12 @@ def main() -> None:
         writer.writerows(rows)
     _write_metric_plot(rows, args.output_dir / "metric_trends.png")
     _write_volume_plot(rows, args.output_dir / "volume_trends.png")
+    _write_temporal_consistency(rows, args.output_dir / "temporal_consistency.csv")
     print(f"Wrote metrics to {metrics_path}")
     print(f"Wrote overlays under {args.output_dir / 'overlays'}")
     print(f"Wrote metric plot to {args.output_dir / 'metric_trends.png'}")
     print(f"Wrote volume plot to {args.output_dir / 'volume_trends.png'}")
+    print(f"Wrote temporal consistency to {args.output_dir / 'temporal_consistency.csv'}")
 
 
 if __name__ == "__main__":
