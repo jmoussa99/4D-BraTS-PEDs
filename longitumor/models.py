@@ -196,7 +196,10 @@ class EvolutionHead(nn.Module):
         clinical_covariates: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         volumes = probabilities.flatten(3).mean(dim=-1)
-        prev = F.pad(volumes[:, :-1], (0, 0, 1, 0), mode="replicate")
+        if volumes.shape[1] > 1:
+            prev = F.pad(volumes[:, :-1], (0, 0, 1, 0), mode="replicate")
+        else:
+            prev = volumes
         growth = (volumes - prev) / prev.clamp_min(1e-6)
         pieces = [embedding, volumes, growth]
         if clinical_covariates is not None:

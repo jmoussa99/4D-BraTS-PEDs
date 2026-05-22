@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import shutil
 import sys
 from pathlib import Path
 
@@ -180,6 +181,9 @@ def main() -> None:
 
     rows: list[dict[str, str]] = []
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    overlays_dir = args.output_dir / "overlays"
+    if overlays_dir.exists():
+        shutil.rmtree(overlays_dir)
     with torch.no_grad():
         for sequence_index, batch in enumerate(tqdm(loader, desc="evaluating")):
             if args.limit is not None and sequence_index >= args.limit:
@@ -256,7 +260,7 @@ def main() -> None:
                     image=image,
                     target=target_union,
                     pred=pred_union,
-                    output_path=args.output_dir / "overlays" / patient_id / f"time_{time_index:02d}.png",
+                    output_path=overlays_dir / patient_id / f"time_{time_index:02d}.png",
                     title=f"{patient_id} time {time_index}",
                 )
 
