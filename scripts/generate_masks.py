@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from longitumor.data import VisitRecord, read_manifest, write_manifest
-from longitumor.inference import load_segmentation_model, predict_visit_mask
+from longitumor.inference import load_segmentation_model, predict_visit_mask, write_pseudo_mask_copies
 
 
 def _with_generated_masks(records: list[VisitRecord], mask_paths: list[Path]) -> list[VisitRecord]:
@@ -48,6 +48,28 @@ def main() -> None:
     parser.add_argument("--pediatric-python", default=sys.executable)
     parser.add_argument("--pediatric-command", default="nnUNetv2_predict")
     parser.add_argument(
+        "--write-modality-space-masks",
+        action="store_true",
+        help="For checkpoint inference, also write nearest-neighbor mask copies aligned to each selected modality grid.",
+    )
+    parser.add_argument(
+        "--postprocess",
+        action="store_true",
+        help="Remove tiny disconnected components from checkpoint-generated masks before writing review copies.",
+    )
+    parser.add_argument("--min-component-ml", type=float, default=0.02)
+    parser.add_argument("--max-components-per-label", type=int, default=3)
+    parser.add_argument(
+        "--write-reference-mask-copies",
+        action="store_true",
+        help="Deprecated alias for --write-pseudo-mask-copies.",
+    )
+    parser.add_argument(
+        "--write-pseudo-mask-copies",
+        action="store_true",
+        help="Also copy/resample the manifest pseudo mask next to each generated prediction for visual comparison.",
+    )
+    parser.add_argument(
         "--output-manifest",
         type=Path,
         default=None,
@@ -66,7 +88,25 @@ def main() -> None:
         written = []
         for record in tqdm(records, desc="generating masks"):
             output = args.output_dir / record.patient_id / f"{record.visit_id}_seg.nii.gz"
-            written.append(predict_visit_mask(model, record, output, device, threshold=args.threshold))
+            written.append(
+                predict_visit_mask(
+                    model,
+                    record,
+                    output,
+                    device,
+                    threshold=args.threshold,
+                    write_modality_space_masks=args.write_modality_space_masks,
+                    postprocess=args.postprocess,
+                    min_component_ml=args.min_component_ml,
+                    max_components_per_label=args.max_components_per_label,
+                )
+            )
+            if args.write_pseudo_mask_copies or args.write_reference_mask_copies:
+                write_pseudo_mask_copies(
+                    record,
+                    output,
+                    write_modality_space_masks=args.write_modality_space_masks,
+                )
     else:
         from longitumor.inference import generate_pediatric_brain_tumor_masks
 

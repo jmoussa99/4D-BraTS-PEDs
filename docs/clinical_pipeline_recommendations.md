@@ -24,16 +24,18 @@ for the current milestone.
 Ground Truth And Labels
 -----------------------
 
-Use manual reference-standard diagnosis-time annotations as true ground truth.
-Use pediatric nnU-Net generated masks as pseudo-labels only when manual masks
-are unavailable. Reports, slides, and metrics should clearly separate:
+Manual segmentation masks are not currently available in this workspace. The
+available mask files should therefore be treated as pseudo/candidate masks, not
+clinical ground truth. Reports, slides, and metrics should clearly separate:
 
-* manual reference-standard masks,
-* pseudo-label masks,
-* model-generated masks for review.
+* pseudo nnU-Net candidate masks,
+* longitudinal model candidate masks,
+* manual/radiologist review decisions.
 
-This avoids presenting a downstream result trained or evaluated on automatic
-masks as if it were fully manually validated.
+If manual diagnosis-time annotations become available later, they can be added
+as true ground truth for Dice and calibration. Until then, quantitative results
+should be described as pseudo-label agreement and longitudinal plausibility,
+with clinical acceptability determined by visual review.
 
 
 Recommended Pipeline
@@ -43,7 +45,7 @@ Recommended Pipeline
 2. Run sequence classification for all candidate MRI volumes.
 3. Review sequence-classification confidence and selected paths.
 4. Build a baseline/mid/end manifest per patient.
-5. Generate or attach segmentation masks for selected timepoints.
+5. Generate or attach pseudo/candidate segmentation masks for selected timepoints.
 6. Train/run longitudinal segmentation for observed timepoints.
 7. Export volumetric agreement, temporal consistency, overlays, and volume plots.
 8. Create a radiology review sheet with Likert/acceptability fields.
@@ -69,7 +71,7 @@ Preprocessing And Harmonization
 -------------------------------
 
 Before stacking modalities, every visit should be resampled to a common grid.
-The loader already resamples modalities to the visit mask/reference grid. Review
+The loader already resamples modalities to a visit image/pseudo-mask grid. Review
 outputs should be inspected for:
 
 * wrong sequence selection,
@@ -84,14 +86,14 @@ Evaluation
 
 Quantitative evaluation should prioritize:
 
-* volumetric agreement,
-* predicted volume over time,
-* target/reference volume over time when available,
+* pseudo-label volumetric agreement,
+* model candidate volume over time,
+* pseudo-mask volume over time,
 * temporal consistency of volume and mask behavior.
 
-Dice can be reported for the manually annotated subset, but broad review should
-use radiologist visual evaluation with a Likert or acceptable/unacceptable
-scale.
+Dice-like overlap can be reported only as agreement with pseudo masks unless a
+manual annotated subset is attached. Broad review should use radiologist visual
+evaluation with a Likert or acceptable/unacceptable scale.
 
 Suggested review fields:
 

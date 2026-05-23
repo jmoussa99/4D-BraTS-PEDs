@@ -6,9 +6,18 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from longitumor.data import VisitRecord, discover_cases, discover_modalities, infer_modality, labels_to_channels, random_patch_slices
+from longitumor.data import (
+    VisitRecord,
+    discover_cases,
+    discover_modalities,
+    infer_modality,
+    labels_to_channels,
+    looks_like_localizer,
+    random_patch_slices,
+)
 from longitumor.inference import predict_visit_mask
 from longitumor.models import LongiTumorMamba, LongiTumorMambaConfig
+from longitumor.qc import clean_label_array_components
 from longitumor.training import DiceBCELoss
 
 
@@ -37,6 +46,14 @@ def test_infer_modality_from_clinical_filenames(tmp_path) -> None:
         path = tmp_path / name
         path.touch()
         assert infer_modality(path) == modality
+
+
+def test_localizer_series_are_rejected(tmp_path) -> None:
+    path = tmp_path / "02 - 3 Plane Loc" / "3_Plane_Loc_i00026.nii.gz"
+    path.parent.mkdir()
+    path.touch()
+    assert looks_like_localizer(path)
+    assert infer_modality(path) is None
 
 
 def test_discover_modalities_from_named_files(tmp_path) -> None:
@@ -95,6 +112,16 @@ def test_discover_cases_from_trial_style_series_folders(tmp_path) -> None:
         "t1_mprage_tra_p2_iso_1.0_POST.nii.gz",
         "t2_tirm_tra_dark_p2_brain.nii.gz",
     )
+
+
+def test_clean_label_array_components_removes_tiny_islands() -> None:
+    sitk = pytest.importorskip("SimpleITK")
+    label = torch.zeros(8, 16, 16, dtype=torch.uint8).numpy()
+    label[2:5, 4:9, 4:9] = 2
+    label[0, 0, 0] = 2
+    cleaned = clean_label_array_components(label, spacing=(1.0, 1.0, 1.0), min_component_ml=0.01)
+    assert cleaned[2:5, 4:9, 4:9].sum() > 0
+    assert cleaned[0, 0, 0] == 0
 
 
 def test_discover_cases_with_content_classifier_for_anonymous_files(tmp_path) -> None:

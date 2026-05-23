@@ -14,7 +14,10 @@ from .data import _require_sitk, load_volume
 
 
 DEFAULT_LABEL_MAP = {
+    "DTI": None,
+    "DWI": None,
     "FLAIR": "flair",
+    "OTHER": None,
     "T1": "t1",
     "T1C": "t1c",
     "T1CE": "t1c",

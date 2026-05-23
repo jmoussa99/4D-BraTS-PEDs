@@ -15,6 +15,7 @@ import torch
 
 from .data import MODALITY_NAMES, VisitRecord, read_manifest, zscore_nonzero
 from .models import LongiTumorMamba, LongiTumorMambaConfig
+from .qc import clean_mask_components
 from .utils import choose_device
 
 try:
@@ -70,13 +71,34 @@ def _resample_to_reference(image: sitk.Image, reference: sitk.Image) -> sitk.Ima
     )
 
 
+def _resample_label_to_reference(label_image: sitk.Image, reference: sitk.Image) -> sitk.Image:
+    if (
+        label_image.GetSize() == reference.GetSize()
+        and label_image.GetSpacing() == reference.GetSpacing()
+        and label_image.GetOrigin() == reference.GetOrigin()
+        and label_image.GetDirection() == reference.GetDirection()
+    ):
+        return label_image
+    return sitk.Resample(
+        label_image,
+        reference,
+        sitk.Transform(),
+        sitk.sitkNearestNeighbor,
+        0,
+        label_image.GetPixelID(),
+    )
+
+
+def _reference_path(record: VisitRecord) -> str:
+    path = record.mask_path or next((path for path in record.modalities if path), None)
+    if path is None:
+        raise ValueError(f"No reference image found for {record.patient_id}/{record.visit_id}")
+    return path
+
+
 def _load_modalities(record: VisitRecord) -> tuple[torch.Tensor, torch.Tensor, sitk.Image]:
     _require_sitk()
-    reference_path = next((path for path in record.modalities if path), None)
-    if reference_path is None:
-        raise ValueError(f"No modalities found for {record.patient_id}/{record.visit_id}")
-
-    reference = sitk.ReadImage(str(reference_path))
+    reference = sitk.ReadImage(str(_reference_path(record)))
     reference_shape = tuple(reversed(reference.GetSize()))
     volumes: list[np.ndarray] = []
     availability: list[float] = []
@@ -248,6 +270,10 @@ def predict_visit_mask(
     output_path: str | Path,
     device: torch.device,
     threshold: float = 0.5,
+    write_modality_space_masks: bool = False,
+    postprocess: bool = False,
+    min_component_ml: float = 0.02,
+    max_components_per_label: int = 3,
 ) -> Path:
     image, availability, reference = _load_modalities(record)
     image = image.to(device)
@@ -261,7 +287,72 @@ def predict_visit_mask(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     sitk.WriteImage(mask_image, str(output))
+    if postprocess:
+        clean_mask_components(
+            output,
+            output,
+            min_component_ml=min_component_ml,
+            max_components_per_label=max_components_per_label,
+        )
+        mask_image = sitk.ReadImage(str(output))
+    if write_modality_space_masks:
+        stem = output.name.removesuffix(".nii.gz").removesuffix(".nii")
+        for modality, path in zip(MODALITY_NAMES, record.modalities):
+            if not path:
+                continue
+            modality_reference = sitk.ReadImage(str(path))
+            modality_mask = _resample_label_to_reference(mask_image, modality_reference)
+            sitk.WriteImage(modality_mask, str(output.with_name(f"{stem}_{modality}.nii.gz")))
     return output
+
+
+def write_pseudo_mask_copies(
+    record: VisitRecord,
+    output_path: str | Path,
+    write_modality_space_masks: bool = False,
+    suffix: str = "pseudo_nnunet",
+) -> Path | None:
+    _require_sitk()
+    if not record.mask_path:
+        return None
+    source = Path(record.mask_path)
+    if not source.exists():
+        raise FileNotFoundError(f"Pseudo mask not found: {source}")
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    stem = output.name.removesuffix(".nii.gz").removesuffix(".nii")
+    pseudo_output = output.with_name(f"{stem}_{suffix}.nii.gz")
+    pseudo_mask = sitk.ReadImage(str(source))
+    sitk.WriteImage(pseudo_mask, str(pseudo_output))
+
+    if write_modality_space_masks:
+        for modality, path in zip(MODALITY_NAMES, record.modalities):
+            if not path:
+                continue
+            modality_reference = sitk.ReadImage(str(path))
+            modality_mask = _resample_label_to_reference(pseudo_mask, modality_reference)
+            sitk.WriteImage(modality_mask, str(output.with_name(f"{stem}_{suffix}_{modality}.nii.gz")))
+    return pseudo_output
+
+
+def write_reference_mask_copies(
+    record: VisitRecord,
+    output_path: str | Path,
+    write_modality_space_masks: bool = False,
+) -> Path | None:
+    """Backward-compatible alias for older commands.
+
+    The manifest masks in this workspace are pseudo/candidate masks, not
+    manual clinical reference standards.
+    """
+
+    return write_pseudo_mask_copies(
+        record,
+        output_path,
+        write_modality_space_masks=write_modality_space_masks,
+        suffix="reference",
+    )
 
 
 def generate_manifest_masks(
@@ -271,6 +362,7 @@ def generate_manifest_masks(
     device_name: str = "auto",
     threshold: float = 0.5,
     records: Sequence[VisitRecord] | None = None,
+    write_modality_space_masks: bool = False,
 ) -> list[Path]:
     model, device = load_segmentation_model(checkpoint, device_name)
     visits = list(records) if records is not None else read_manifest(Path(manifest))
@@ -278,5 +370,14 @@ def generate_manifest_masks(
     root = Path(output_dir)
     for record in visits:
         output = root / record.patient_id / f"{record.visit_id}_seg.nii.gz"
-        outputs.append(predict_visit_mask(model, record, output, device, threshold=threshold))
+        outputs.append(
+            predict_visit_mask(
+                model,
+                record,
+                output,
+                device,
+                threshold=threshold,
+                write_modality_space_masks=write_modality_space_masks,
+            )
+        )
     return outputs

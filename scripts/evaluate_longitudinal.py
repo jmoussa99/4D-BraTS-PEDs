@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from longitumor.data import LongitudinalMRIDataset, read_manifest
 from longitumor.evaluation import dice_score, sensitivity_precision, volume_similarity
 from longitumor.inference import load_segmentation_model
+from longitumor.qc import clean_label_array_components
 from longitumor.utils import parse_patch_size
 
 
@@ -33,10 +34,10 @@ def _normalize_image(image: np.ndarray) -> np.ndarray:
     return np.clip((image - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
 
 
-def _best_slice(target: np.ndarray, pred: np.ndarray) -> int:
-    target_area = target.sum(axis=(1, 2))
-    if target_area.max() > 0:
-        return int(target_area.argmax())
+def _best_slice(pseudo: np.ndarray, pred: np.ndarray) -> int:
+    pseudo_area = pseudo.sum(axis=(1, 2))
+    if pseudo_area.max() > 0:
+        return int(pseudo_area.argmax())
     pred_area = pred.sum(axis=(1, 2))
     if pred_area.max() > 0:
         return int(pred_area.argmax())
@@ -45,20 +46,20 @@ def _best_slice(target: np.ndarray, pred: np.ndarray) -> int:
 
 def _write_overlay(
     image: np.ndarray,
-    target: np.ndarray,
+    pseudo: np.ndarray,
     pred: np.ndarray,
     output_path: Path,
     title: str,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    z = _best_slice(target, pred)
+    z = _best_slice(pseudo, pred)
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.imshow(_normalize_image(image[z]), cmap="gray")
-    if target[z].any():
-        ax.contour(target[z], levels=[0.5], colors=["lime"], linewidths=1.2)
+    if pseudo[z].any():
+        ax.contour(pseudo[z], levels=[0.5], colors=["lime"], linewidths=1.2)
     if pred[z].any():
         ax.contour(pred[z], levels=[0.5], colors=["red"], linewidths=1.2)
-    ax.set_title(f"{title} z={z}  target=green pred=red", fontsize=10)
+    ax.set_title(f"{title} z={z}  pseudo=green model=red", fontsize=10)
     ax.axis("off")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -80,7 +81,7 @@ def _write_metric_plot(rows: list[dict[str, str]], output_path: Path) -> None:
     ax.plot(x, sensitivity, marker="o", label="Sensitivity")
     ax.plot(x, precision, marker="o", label="Precision")
     ax.set_ylim(0.0, 1.05)
-    ax.set_ylabel("score")
+    ax.set_ylabel("pseudo-label agreement")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax.grid(axis="y", alpha=0.25)
@@ -97,12 +98,12 @@ def _write_volume_plot(rows: list[dict[str, str]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     labels = [f"{row['patient_id']} t{row['time_index']}" for row in mean_rows]
     pred = [float(row["pred_volume_ml"]) for row in mean_rows]
-    target = [float(row["target_volume_ml"]) for row in mean_rows]
+    pseudo = [float(row["pseudo_volume_ml"]) for row in mean_rows]
 
     x = np.arange(len(labels))
     fig, ax = plt.subplots(figsize=(max(9, len(labels) * 0.55), 5))
-    ax.plot(x, pred, marker="o", label="Predicted")
-    ax.plot(x, target, marker="o", label="Reference")
+    ax.plot(x, pred, marker="o", label="Model candidate")
+    ax.plot(x, pseudo, marker="o", label="Pseudo nnU-Net")
     ax.set_ylabel("volume (mL)")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
@@ -125,8 +126,8 @@ def _write_temporal_consistency(rows: list[dict[str, str]], output_path: Path) -
         for previous, current in zip(ordered, ordered[1:]):
             prev_pred = float(previous["pred_volume_ml"])
             curr_pred = float(current["pred_volume_ml"])
-            prev_target = float(previous["target_volume_ml"])
-            curr_target = float(current["target_volume_ml"])
+            prev_pseudo = float(previous["pseudo_volume_ml"])
+            curr_pseudo = float(current["pseudo_volume_ml"])
             temporal_rows.append(
                 {
                     "patient_id": patient_id,
@@ -137,8 +138,8 @@ def _write_temporal_consistency(rows: list[dict[str, str]], output_path: Path) -
                     "to_delta_t": current["delta_t"],
                     "pred_volume_change_ml": f"{curr_pred - prev_pred:.6f}",
                     "pred_relative_change": f"{(curr_pred - prev_pred) / max(prev_pred, 1e-6):.6f}",
-                    "target_volume_change_ml": f"{curr_target - prev_target:.6f}",
-                    "target_relative_change": f"{(curr_target - prev_target) / max(prev_target, 1e-6):.6f}",
+                    "pseudo_volume_change_ml": f"{curr_pseudo - prev_pseudo:.6f}",
+                    "pseudo_relative_change": f"{(curr_pseudo - prev_pseudo) / max(prev_pseudo, 1e-6):.6f}",
                 }
             )
 
@@ -155,8 +156,8 @@ def _write_temporal_consistency(rows: list[dict[str, str]], output_path: Path) -
                 "to_delta_t",
                 "pred_volume_change_ml",
                 "pred_relative_change",
-                "target_volume_change_ml",
-                "target_relative_change",
+                "pseudo_volume_change_ml",
+                "pseudo_relative_change",
             ],
         )
         writer.writeheader()
@@ -164,7 +165,7 @@ def _write_temporal_consistency(rows: list[dict[str, str]], output_path: Path) -
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Save longitudinal prediction overlays and metric plots.")
+    parser = argparse.ArgumentParser(description="Save longitudinal candidate overlays and pseudo-label agreement plots.")
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/longitumor_eval"))
@@ -172,6 +173,9 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--limit", type=int, default=None, help="Optional number of patient sequences to evaluate.")
+    parser.add_argument("--postprocess", action="store_true", help="Clean tiny disconnected components before plots/volumes.")
+    parser.add_argument("--min-component-ml", type=float, default=0.02)
+    parser.add_argument("--max-components-per-label", type=int, default=3)
     args = parser.parse_args()
 
     model, device = load_segmentation_model(args.checkpoint, args.device)
@@ -197,18 +201,34 @@ def main() -> None:
             probabilities = output.probabilities.detach().cpu()
             target_cpu = target.detach().cpu()
             image_cpu = batch["image"].detach().cpu()
-            pred_cpu = (probabilities >= args.threshold).float()
             spacing_cpu = batch["spacing"].detach().cpu()
             delta_t_cpu = batch["delta_t"].detach().cpu()
+            pred_cpu = (probabilities >= args.threshold).float()
+            if args.postprocess:
+                cleaned = torch.zeros_like(pred_cpu)
+                for time_index in range(probabilities.shape[1]):
+                    spacing = tuple(float(v) for v in spacing_cpu[0, time_index].tolist())
+                    label = torch.argmax(pred_cpu[0, time_index], dim=0).numpy().astype(np.uint8) + 1
+                    label[pred_cpu[0, time_index].amax(dim=0).numpy() <= 0] = 0
+                    cleaned_label = clean_label_array_components(
+                        label,
+                        spacing=spacing,
+                        min_component_ml=args.min_component_ml,
+                        max_components_per_label=args.max_components_per_label,
+                    )
+                    for class_index in range(len(CLASS_NAMES)):
+                        cleaned[0, time_index, class_index] = torch.from_numpy((cleaned_label == class_index + 1).astype(np.float32))
+                pred_cpu = cleaned
 
-            dice = dice_score(probabilities.reshape(-1, *probabilities.shape[2:]), target_cpu.reshape(-1, *target_cpu.shape[2:]), args.threshold)
+            metric_pred = pred_cpu if args.postprocess else probabilities
+            dice = dice_score(metric_pred.reshape(-1, *metric_pred.shape[2:]), target_cpu.reshape(-1, *target_cpu.shape[2:]), args.threshold)
             sensitivity, precision = sensitivity_precision(
-                probabilities.reshape(-1, *probabilities.shape[2:]),
+                metric_pred.reshape(-1, *metric_pred.shape[2:]),
                 target_cpu.reshape(-1, *target_cpu.shape[2:]),
                 args.threshold,
             )
             vol_sim = volume_similarity(
-                probabilities.reshape(-1, *probabilities.shape[2:]),
+                metric_pred.reshape(-1, *metric_pred.shape[2:]),
                 target_cpu.reshape(-1, *target_cpu.shape[2:]),
                 args.threshold,
             )
@@ -235,7 +255,7 @@ def main() -> None:
                             "class": class_name,
                             **{name: f"{tensor[class_index].item():.6f}" for name, tensor in values.items()},
                             "pred_volume_ml": f"{pred_volumes[class_index].item():.6f}",
-                            "target_volume_ml": f"{target_volumes[class_index].item():.6f}",
+                            "pseudo_volume_ml": f"{target_volumes[class_index].item():.6f}",
                         }
                     )
                 rows.append(
@@ -247,7 +267,7 @@ def main() -> None:
                         "class": "mean",
                         **{name: f"{tensor.mean().item():.6f}" for name, tensor in values.items()},
                         "pred_volume_ml": f"{pred_volumes.sum().item():.6f}",
-                        "target_volume_ml": f"{target_volumes.sum().item():.6f}",
+                        "pseudo_volume_ml": f"{target_volumes.sum().item():.6f}",
                     }
                 )
 
@@ -258,7 +278,7 @@ def main() -> None:
                 pred_union = pred_cpu[0, time_index].amax(dim=0).numpy()
                 _write_overlay(
                     image=image,
-                    target=target_union,
+                    pseudo=target_union,
                     pred=pred_union,
                     output_path=overlays_dir / patient_id / f"time_{time_index:02d}.png",
                     title=f"{patient_id} time {time_index}",
@@ -279,7 +299,7 @@ def main() -> None:
                 "precision",
                 "volume_similarity",
                 "pred_volume_ml",
-                "target_volume_ml",
+                "pseudo_volume_ml",
             ],
         )
         writer.writeheader()

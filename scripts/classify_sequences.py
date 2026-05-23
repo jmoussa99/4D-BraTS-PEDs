@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from longitumor.data import SEG_EXTENSIONS
+from longitumor.data import SEG_EXTENSIONS, looks_like_localizer
 from longitumor.sequence_classifier import classify_volume_sequence
 
 
@@ -29,6 +29,11 @@ def main() -> None:
     parser.add_argument("--num-slices", type=int, default=9)
     parser.add_argument("--include-path-token", action="append", default=[])
     parser.add_argument("--exclude-path-token", action="append", default=[])
+    parser.add_argument(
+        "--include-localizers",
+        action="store_true",
+        help="Classify scout/localizer series too. By default these are skipped.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
@@ -39,6 +44,8 @@ def main() -> None:
         paths = [path for path in paths if any(token in str(path).lower() for token in include_tokens)]
     if exclude_tokens:
         paths = [path for path in paths if not any(token in str(path).lower() for token in exclude_tokens)]
+    if not args.include_localizers:
+        paths = [path for path in paths if not looks_like_localizer(path)]
     if args.limit is not None:
         paths = paths[: args.limit]
 

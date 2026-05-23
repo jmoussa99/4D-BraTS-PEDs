@@ -61,6 +61,20 @@ Create a brain-only manifest and omit spine visits:
 Step 2: Sequence Classification QC
 ----------------------------------
 
+Fetch MRISeqClassifier and place its pretrained models before running QC:
+
+    git clone https://github.com/JinqianPan/MRISeqClassifier.git MRISeqClassifier
+
+Download the upstream `best_model` folder from the MRISeqClassifier README and
+place it at:
+
+    MRISeqClassifier\02_models\best_model
+
+Check readiness:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\check_mriseqclassifier.py ^
+      --mriseqclassifier-repo MRISeqClassifier
+
 Run MRISeqClassifier on candidate images. This is the first critical component
 because downstream segmentation depends on correct sequence identification.
 
@@ -70,6 +84,14 @@ because downstream segmentation depends on correct sequence identification.
       --output runs\sequence_qc.csv ^
       --include-path-token brain ^
       --exclude-path-token spine
+
+The manifest builder also rejects scout/localizer-style series names such as
+3 Plane Loc, localizer, scout, survey, and topogram.
+
+MRISeqClassifier predicts DTI, DWI, FLAIR, OTHER, T1, and T2. It does not
+directly separate T1 from T1 contrast-enhanced, so this pipeline keeps using
+series names and metadata tokens such as post, gad, contrast, and enhanced to
+identify T1c among classifier-supported T1 candidates.
 
 To create a manifest using MRISeqClassifier predictions:
 
@@ -100,7 +122,7 @@ available. At minimum, keep patients with at least two selected timepoints.
 Step 4: Segmentation Masks
 --------------------------
 
-Generate pediatric nnU-Net pseudo-masks when manual masks are unavailable:
+Generate pediatric nnU-Net candidate pseudo-masks when manual masks are unavailable:
 
     .\.venv-nnunet\Scripts\python.exe scripts\generate_masks.py ^
       --manifest trial_manifest_baseline_mid_end.csv ^
@@ -109,17 +131,31 @@ Generate pediatric nnU-Net pseudo-masks when manual masks are unavailable:
       --output-manifest trial_manifest_baseline_mid_end_masks.csv ^
       --device 0
 
-Manual reference-standard diagnosis-time masks should be treated as true
-ground truth. Pediatric nnU-Net masks are pseudo-labels unless manually reviewed.
+No manual segmentation masks are currently available in this workspace. Treat
+the manifest mask column as pseudo/candidate labels only, not clinical ground
+truth. Metrics against those masks are pseudo-label agreement, and the primary
+evaluation is radiologist visual review plus longitudinal volume plausibility.
 
 
 Step 5: Longitudinal Segmentation
 ---------------------------------
 
-Train observed longitudinal segmentation:
+QC pseudo-labels before retraining. This removes localizer/scout inputs, rejects
+implausible pseudo masks, cleans tiny disconnected components, and writes a
+cleaned manifest:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\qc_pseudo_masks.py ^
+      --manifest trial_manifest_baseline_mid_end_masks.csv ^
+      --output-manifest trial_manifest_baseline_mid_end_qc.csv ^
+      --output-mask-dir runs\pseudo_masks_qc ^
+      --qc-report runs\pseudo_mask_qc.csv
+
+Train observed longitudinal segmentation on the cleaned manifest when it has
+enough retained visits. If QC rejects all visits, do not retrain; use the QC
+report to show that the pseudo labels are not suitable supervision yet.
 
     .\.venv-nnunet\Scripts\python.exe scripts\train_longitudinal.py ^
-      --manifest trial_manifest_baseline_mid_end_masks.csv ^
+      --manifest trial_manifest_baseline_mid_end_qc.csv ^
       --epochs 100 ^
       --batch-size 1 ^
       --output-dir runs\longitumor_observed_gpu ^
@@ -132,25 +168,41 @@ Generate model masks with the trained checkpoint:
       --checkpoint runs\longitumor_observed_gpu\last.pt ^
       --output-dir runs\longitumor_observed_gpu_masks ^
       --output-manifest runs\longitumor_observed_gpu_manifest.csv ^
-      --device cuda
+      --device cuda ^
+      --write-modality-space-masks ^
+      --write-pseudo-mask-copies ^
+      --postprocess ^
+      --min-component-ml 0.05 ^
+      --max-components-per-label 3
 
 
 Step 6: Evaluation And Review Outputs
 -------------------------------------
 
-Export overlays, volumetric agreement, temporal consistency, and volume plots:
+Export pseudo-label agreement overlays, temporal consistency, and volume plots:
 
     .\.venv-nnunet\Scripts\python.exe scripts\evaluate_longitudinal.py ^
       --manifest trial_manifest_baseline_mid_end_masks.csv ^
       --checkpoint runs\longitumor_observed_gpu\last.pt ^
       --output-dir runs\longitumor_observed_gpu_eval ^
-      --device cuda
+      --device cuda ^
+      --postprocess ^
+      --min-component-ml 0.05 ^
+      --max-components-per-label 3
 
 Create a radiology Likert review sheet:
 
     .\.venv-nnunet\Scripts\python.exe scripts\create_review_sheet.py ^
       --overlay-dir runs\longitumor_observed_gpu_eval\overlays ^
       --output runs\longitumor_observed_gpu_eval\visual_review.csv
+
+Export ITK-SNAP review folders with MRI images and matching mask dimensions:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\export_review_cases.py ^
+      --manifest trial_manifest_baseline_mid_end_masks.csv ^
+      --pred-mask-dir runs\longitumor_observed_gpu_masks ^
+      --output-dir runs\longitumor_review_cases ^
+      --copy-original-pseudo-mask
 
 Main review outputs:
 
@@ -159,6 +211,7 @@ Main review outputs:
     runs\longitumor_observed_gpu_eval\metric_trends.png
     runs\longitumor_observed_gpu_eval\volume_trends.png
     runs\longitumor_observed_gpu_eval\visual_review.csv
+    runs\longitumor_review_cases\review_index.csv
 
 
 Architecture And Workflow Docs

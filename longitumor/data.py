@@ -115,6 +115,17 @@ MODALITY_ALIASES = {
     },
     "t2": {"t2", "t2w", "t2weighted", "t2_weighted", "t2-weighted"},
 }
+LOCALIZER_TOKENS = {
+    "loc",
+    "localizer",
+    "scout",
+    "survey",
+    "topogram",
+    "3plane",
+    "3_plane",
+    "threeplane",
+    "three_plane",
+}
 
 
 @dataclass(frozen=True)
@@ -166,6 +177,19 @@ def _tokens(path: Path) -> set[str]:
     return tokens
 
 
+def looks_like_localizer(path: str | Path) -> bool:
+    """Return True for scout/localizer series that should not feed segmentation."""
+
+    path = Path(path)
+    text = path.as_posix().lower()
+    toks: set[str] = set()
+    for part in path.parts:
+        toks |= _tokens(Path(part))
+    if toks & LOCALIZER_TOKENS:
+        return True
+    return any(token in text for token in ("3 plane", "3-plane", "localizer", "scout", "survey", "topogram"))
+
+
 def _looks_like_segmentation_name(path: Path) -> bool:
     toks = _tokens(path)
     preferred = {token.lower() for token in PREFERRED_SEG_TOKENS if len(token) > 2}
@@ -179,6 +203,8 @@ def infer_modality(path: Path) -> str | None:
     arbitrary clinical filenames usable while preserving `_0000.._0003` support.
     """
 
+    if looks_like_localizer(path):
+        return None
     toks = _tokens(path)
     if toks & SEGMENTATION_TOKENS:
         return None
@@ -215,6 +241,8 @@ def discover_modalities(
     candidates: dict[str, list[Path]] = {name: [] for name in MODALITY_NAMES}
     classifier_scores: dict[Path, float] = {}
     for item in _iter_image_files(case_dir, recursive=True):
+        if looks_like_localizer(item):
+            continue
         modality = infer_modality(item)
         if modality is None and modality_classifier is not None:
             try:
