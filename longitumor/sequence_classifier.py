@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import shutil
 import subprocess
 import tempfile
@@ -96,6 +97,32 @@ def _read_toolkit_votes(result_csv: Path) -> list[str]:
         return [row["vote"].strip() for row in reader if row.get("vote")]
 
 
+def _write_compatible_toolkit(source_toolkit: Path, output_dir: Path) -> Path:
+    text = source_toolkit.read_text()
+    text = text.replace(
+        "BEST_MODLE_PATH = './02_models/best_model'",
+        "BEST_MODLE_PATH = os.environ.get('MRISEQ_BEST_MODEL_PATH', './02_models/best_model')",
+    )
+    text = text.replace(
+        "model_name = file_path.split('/')[-2]",
+        "model_name = os.path.basename(os.path.dirname(file_path))",
+    )
+    text = text.replace(
+        "df.iloc[:, 1:] = df.iloc[:, 1:].applymap(lambda x: mapping.get(x, x))",
+        (
+            "mapper = lambda x: mapping.get(x, x)\n"
+            "    if hasattr(df.iloc[:, 1:], 'map'):\n"
+            "        mapped_predictions = df.iloc[:, 1:].map(mapper)\n"
+            "    else:\n"
+            "        mapped_predictions = df.iloc[:, 1:].applymap(mapper)\n"
+            "    df = pd.concat([df.iloc[:, :1], mapped_predictions], axis=1)"
+        ),
+    )
+    patched = output_dir / "05_toolkit_compatible.py"
+    patched.write_text(text)
+    return patched
+
+
 def classify_volume_sequence(
     volume_path: str | Path,
     classifier_repo: str | Path,
@@ -114,7 +141,13 @@ def classify_volume_sequence(
     toolkit = repo / "05_toolkit.py"
     if not toolkit.exists():
         raise FileNotFoundError(f"Could not find MRISeqClassifier toolkit script: {toolkit}")
-    if not (repo / "02_models" / "best_model").exists():
+    preferred_model_root = repo / "02_models" / "best_model"
+    fallback_model_root = repo / "02_models"
+    if preferred_model_root.exists():
+        model_root = preferred_model_root
+    elif any(fallback_model_root.glob("*/*mid_best_model.pth")):
+        model_root = fallback_model_root
+    else:
         raise FileNotFoundError(
             "MRISeqClassifier best models were not found. Download them into "
             f"{repo / '02_models' / 'best_model'} as described by the upstream README."
@@ -122,14 +155,19 @@ def classify_volume_sequence(
 
     label_map = label_map or DEFAULT_LABEL_MAP
     with tempfile.TemporaryDirectory(prefix="longitumor_mriseq_") as tmp:
+        tmp_path = Path(tmp)
         image_dir = Path(tmp) / "slices"
         export_volume_slices(volume_path, image_dir, num_slices=num_slices)
+        compatible_toolkit = _write_compatible_toolkit(toolkit, tmp_path)
         result_csv = repo / "result.csv"
         if result_csv.exists():
             result_csv.unlink()
+        env = os.environ.copy()
+        env["MRISEQ_BEST_MODEL_PATH"] = str(model_root.resolve())
         subprocess.run(
-            [python_executable, str(toolkit), "--path", str(image_dir)],
+            [python_executable, str(compatible_toolkit), "--path", str(image_dir)],
             cwd=repo,
+            env=env,
             check=True,
             text=True,
             capture_output=True,

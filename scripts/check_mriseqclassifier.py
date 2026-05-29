@@ -12,13 +12,16 @@ def main() -> None:
     args = parser.parse_args()
 
     repo = args.mriseqclassifier_repo
+    preferred_model_root = repo / "02_models" / "best_model"
+    fallback_model_root = repo / "02_models"
+    fallback_files = sorted(fallback_model_root.glob("*/*mid_best_model.pth")) if fallback_model_root.exists() else []
+    model_root = preferred_model_root if preferred_model_root.exists() else fallback_model_root
     checks = [
         (repo.exists(), f"repo exists: {repo}"),
         ((repo / "05_toolkit.py").exists(), "05_toolkit.py exists"),
-        ((repo / "02_models" / "best_model").exists(), "02_models/best_model exists"),
+        (preferred_model_root.exists() or bool(fallback_files), "best-model weights exist"),
     ]
 
-    model_root = repo / "02_models" / "best_model"
     model_files = sorted(model_root.rglob("*mid_best_model.pth")) if model_root.exists() else []
     checks.append((bool(model_files), "at least one *mid_best_model.pth exists"))
 
@@ -31,7 +34,7 @@ def main() -> None:
             print(f"  {path}")
     else:
         print("\nDownload the pretrained best_model folder from the MRISeqClassifier README Google Drive link.")
-        print(f"Place it at: {model_root}")
+        print(f"Place it at: {preferred_model_root}")
 
     if not all(ok for ok, _ in checks):
         sys.exit(1)

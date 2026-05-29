@@ -14,6 +14,30 @@ Future segmentation forecasting is intentionally out of scope for this
 milestone.
 
 
+One-Command Pipeline
+--------------------
+
+Run the integrated clinical pipeline with the existing checkpoint:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\run_clinical_pipeline.py ^
+      --source-manifest trial_manifest_with_pediatric_masks.csv ^
+      --checkpoint runs\longitumor_observed_gpu\last.pt ^
+      --device cuda
+
+This creates or refreshes:
+
+    trial_manifest_baseline_mid_end.csv
+    trial_manifest_baseline_mid_end_qc.csv
+    runs\sequence_qc.csv
+    runs\pseudo_mask_qc.csv
+    runs\longitumor_observed_gpu_masks
+    runs\longitumor_review_cases
+    runs\longitumor_observed_gpu_eval
+
+Add `--train` only when the QC manifest retains enough pseudo-label visits, or
+use `--allow-unqc-training` only for a clearly labeled weak-baseline experiment.
+
+
 Data Layout
 -----------
 
@@ -84,6 +108,14 @@ because downstream segmentation depends on correct sequence identification.
       --output runs\sequence_qc.csv ^
       --include-path-token brain ^
       --exclude-path-token spine
+
+For the currently selected baseline/mid/end manifest, use the faster targeted
+QC command:
+
+    .\.venv-nnunet\Scripts\python.exe scripts\classify_manifest_sequences.py ^
+      --manifest trial_manifest_baseline_mid_end.csv ^
+      --mriseqclassifier-repo MRISeqClassifier ^
+      --output runs\sequence_qc_manifest.csv
 
 The manifest builder also rejects scout/localizer-style series names such as
 3 Plane Loc, localizer, scout, survey, and topogram.
