@@ -254,7 +254,6 @@ See:
     docs/clinical_pipeline_recommendations.md
     docs/pipeline_architecture.md
 
-
 Version Control Notes
 ---------------------
 
